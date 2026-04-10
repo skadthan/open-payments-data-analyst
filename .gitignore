@@ -28,3 +28,11 @@ Thumbs.db
 
 # Raw data
 raw/
+
+# Ingestion logs
+ingest.log
+*.log
+
+# Auto-generated tool scaffolding
+.chainlit/
+.claude/
