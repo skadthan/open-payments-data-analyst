@@ -1,0 +1,30 @@
+# Open Payments Data Analyst — Configuration
+# All application settings in one file. Change model, paths, or UI without touching code.
+
+model:
+  provider: ollama                    # ollama only for MVP (zero cost, fully local)
+  name: qwen2.5-coder:14b            # any Ollama model tag (swap freely)
+  base_url: http://localhost:11434    # Ollama default local endpoint
+  temperature: 0.1                    # low for deterministic SQL generation
+  summarization_temperature: 0.3     # slightly higher for natural language summaries
+  max_retries: 3                      # SQL self-correction attempts before giving up
+  timeout: 120                        # seconds per LLM call
+
+data:
+  source_dir: ./Datasets
+  parquet_dir: ./data/parquet
+  duckdb_path: ./data/openpayments.duckdb
+  dictionaries_dir: ./DataDictionaries
+
+ingestion:
+  compression: snappy                 # snappy (faster writes) or zstd (smaller files)
+  row_group_size: 500000              # rows per Parquet row group
+  sample_size: 10000                  # CSV auto-detect sample size for DuckDB
+
+ui:
+  title: "Open Payments Data Analyst"
+  max_display_rows: 1000
+  show_sql: true                      # show generated SQL as a collapsible step
+  show_charts: true                   # auto-generate charts for numeric results
+  theme: dark                         # Chainlit theme: dark or light
+  show_agent_steps: true              # show SQL generation/execution as expandable steps
