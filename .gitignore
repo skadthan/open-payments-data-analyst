@@ -29,9 +29,9 @@ Thumbs.db
 # Raw data
 raw/
 
-# Ingestion logs
-ingest.log
+# Logs — ingest.log is committed for reference, other *.log files are ignored
 *.log
+!ingest.log
 
 # Auto-generated tool scaffolding
 .chainlit/

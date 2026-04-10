@@ -1,0 +1,88 @@
+========================================================================
+Open Payments Data Ingestion Pipeline
+========================================================================
+Source CSVs:      C:\Users\skadt\Desktop\vibe-coding\projects\OPDataAnalyst\Datasets
+Parquet output:   C:\Users\skadt\Desktop\vibe-coding\projects\OPDataAnalyst\data\parquet
+DuckDB file:      C:\Users\skadt\Desktop\vibe-coding\projects\OPDataAnalyst\data\openpayments.duckdb
+Dictionaries:     C:\Users\skadt\Desktop\vibe-coding\projects\OPDataAnalyst\DataDictionaries
+Mode:             REBUILD (wipe + re-ingest)
+
+Discovering CSVs ...
+  [general_payments   ] 2021      6.0 GB  OP_DTL_GNRL_PGYR2021_P01232026_01102026.csv
+  [general_payments   ] 2022      6.9 GB  OP_DTL_GNRL_PGYR2022_P01232026_01102026.csv
+  [general_payments   ] 2023      7.6 GB  OP_DTL_GNRL_PGYR2023_P01232026_01102026.csv
+  [general_payments   ] 2024      8.3 GB  OP_DTL_GNRL_PGYR2024_P01232026_01102026.csv
+  [ownership_payments ] 2021      1.7 MB  OP_DTL_OWNRSHP_PGYR2021_P01232026_01102026.csv
+  [ownership_payments ] 2022      1.7 MB  OP_DTL_OWNRSHP_PGYR2022_P01232026_01102026.csv
+  [ownership_payments ] 2023      1.9 MB  OP_DTL_OWNRSHP_PGYR2023_P01232026_01102026.csv
+  [ownership_payments ] 2024      2.0 MB  OP_DTL_OWNRSHP_PGYR2024_P01232026_01102026.csv
+  [removed_deleted    ] 2021      1.1 KB  OP_REMOVED_DELETED_PGYR2021_P01232026_01102026.csv
+  [removed_deleted    ] 2022      3.5 KB  OP_REMOVED_DELETED_PGYR2022_P01232026_01102026.csv
+  [removed_deleted    ] 2023    153.6 KB  OP_REMOVED_DELETED_PGYR2023_P01232026_01102026.csv
+  [removed_deleted    ] 2024    599.7 KB  OP_REMOVED_DELETED_PGYR2024_P01232026_01102026.csv
+  [research_payments  ] 2021    713.1 MB  OP_DTL_RSRCH_PGYR2021_P01232026_01102026.csv
+  [research_payments  ] 2022    904.7 MB  OP_DTL_RSRCH_PGYR2022_P01232026_01102026.csv
+  [research_payments  ] 2023    986.7 MB  OP_DTL_RSRCH_PGYR2023_P01232026_01102026.csv
+  [research_payments  ] 2024    693.1 MB  OP_DTL_RSRCH_PGYR2024_P01232026_01102026.csv
+Found 16 CSVs.
+
+Converting CSV -> Parquet ...
+  [ 1/16] OP_DTL_GNRL_PGYR2021_P01232026_01102026.csv -> general_payments_2021.parquet ...
+           done:   11,552,288 rows     389.5 MB     52.7s
+  [ 2/16] OP_DTL_GNRL_PGYR2022_P01232026_01102026.csv -> general_payments_2022.parquet ...
+           done:   13,306,467 rows     447.8 MB     96.0s
+  [ 3/16] OP_DTL_GNRL_PGYR2023_P01232026_01102026.csv -> general_payments_2023.parquet ...
+           done:   14,700,786 rows     521.3 MB    156.5s
+  [ 4/16] OP_DTL_GNRL_PGYR2024_P01232026_01102026.csv -> general_payments_2024.parquet ...
+           done:   15,385,047 rows     518.8 MB    169.1s
+  [ 5/16] OP_DTL_OWNRSHP_PGYR2021_P01232026_01102026.csv -> ownership_payments_2021.parquet ...
+           done:        4,203 rows     273.6 KB      0.1s
+  [ 6/16] OP_DTL_OWNRSHP_PGYR2022_P01232026_01102026.csv -> ownership_payments_2022.parquet ...
+           done:        4,146 rows     272.1 KB      0.1s
+  [ 7/16] OP_DTL_OWNRSHP_PGYR2023_P01232026_01102026.csv -> ownership_payments_2023.parquet ...
+           done:        4,316 rows     280.5 KB      0.1s
+  [ 8/16] OP_DTL_OWNRSHP_PGYR2024_P01232026_01102026.csv -> ownership_payments_2024.parquet ...
+           done:        4,591 rows     283.0 KB      0.1s
+  [ 9/16] OP_REMOVED_DELETED_PGYR2021_P01232026_01102026.csv -> removed_deleted_2021.parquet ...
+           done:           24 rows       1.1 KB      0.0s
+  [10/16] OP_REMOVED_DELETED_PGYR2022_P01232026_01102026.csv -> removed_deleted_2022.parquet ...
+           done:           81 rows       1.4 KB      0.0s
+  [11/16] OP_REMOVED_DELETED_PGYR2023_P01232026_01102026.csv -> removed_deleted_2023.parquet ...
+           done:        3,824 rows      17.2 KB      0.0s
+  [12/16] OP_REMOVED_DELETED_PGYR2024_P01232026_01102026.csv -> removed_deleted_2024.parquet ...
+           done:       14,939 rows      64.2 KB      0.0s
+  [13/16] OP_DTL_RSRCH_PGYR2021_P01232026_01102026.csv -> research_payments_2021.parquet ...
+           done:      735,276 rows      28.6 MB     26.8s
+  [14/16] OP_DTL_RSRCH_PGYR2022_P01232026_01102026.csv -> research_payments_2022.parquet ...
+           done:    1,002,997 rows      30.7 MB     37.3s
+  [15/16] OP_DTL_RSRCH_PGYR2023_P01232026_01102026.csv -> research_payments_2023.parquet ...
+           done:    1,079,798 rows      31.7 MB     42.3s
+  [16/16] OP_DTL_RSRCH_PGYR2024_P01232026_01102026.csv -> research_payments_2024.parquet ...
+           done:      756,906 rows      25.7 MB     25.2s
+
+Opening persistent DuckDB: C:\Users\skadt\Desktop\vibe-coding\projects\OPDataAnalyst\data\openpayments.duckdb
+Registering per-year views + UNION views ...
+  all_general_payments  <-  years [2021, 2022, 2023, 2024]
+  all_ownership_payments  <-  years [2021, 2022, 2023, 2024]
+  all_removed_deleted  <-  years [2021, 2022, 2023, 2024]
+  all_research_payments  <-  years [2021, 2022, 2023, 2024]
+Building _schema_metadata from data dictionaries ...
+  Loaded  91 fields for general_payments    from General_Paymemnts_DataDictionary_2024.json
+  Loaded 252 fields for research_payments   from Research_Paymemnts_DataDictionary_2024.json
+  Loaded  30 fields for ownership_payments  from Ownership_Paymemnts_DataDictionary_2024.json
+  Loaded   4 hardcoded fields for removed_deleted
+  _schema_metadata: 377 rows total
+
+Row counts (from UNION views):
+  all_general_payments              54,944,588
+  all_ownership_payments                17,256
+  all_removed_deleted                   18,868
+  all_research_payments              3,574,977
+
+========================================================================
+Ingestion complete.
+  Parquet files:     16
+  Total rows:        58,555,689
+  Total Parquet:     1.9 GB
+  Conversion time:   606.5s (10.1 min)
+========================================================================
