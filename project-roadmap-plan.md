@@ -62,8 +62,10 @@ ingestion:
 ui:
   title: "Open Payments Data Analyst"
   max_display_rows: 1000
-  show_sql: true                      # show generated SQL in expandable section
+  show_sql: true                      # show generated SQL as a collapsible step
   show_charts: true                   # auto-generate charts for numeric results
+  theme: "dark"                       # Chainlit theme: "dark" or "light"
+  show_agent_steps: true              # show SQL generation/execution as expandable steps
 ```
 
 ### requirements.txt
@@ -74,7 +76,7 @@ pyarrow>=15.0
 langchain>=0.3
 langchain-community>=0.3
 langchain-ollama>=0.2
-streamlit>=1.30
+chainlit>=1.1
 ollama>=0.3
 pyyaml>=6.0
 plotly>=5.18
@@ -97,8 +99,10 @@ pip install -r requirements.txt
 ```
 
 ### Design Decisions
+- **`chainlit`** over Streamlit — purpose-built for LLM chat applications. Provides a polished, Amazon Q Business-like chat interface out of the box with native streaming, conversation threading, and expandable agent "steps" (perfect for showing SQL generation → execution → summarization). Event-driven architecture (no full-page reruns like Streamlit). First-class LangChain integration via decorators.
 - **`langchain-ollama`** is the dedicated Ollama integration (split from `langchain-community`). Avoids deprecation warnings.
-- **`pandas`** is required because Streamlit's `st.dataframe()` and LangChain's SQL toolkit expect DataFrames.
+- **`pandas`** is required because Chainlit's table elements and LangChain's SQL toolkit expect DataFrames.
+- **`plotly`** is kept for interactive chart generation; Chainlit renders Plotly figures natively via `cl.Plotly` elements.
 - **snappy** compression over zstd as default — ingestion speed matters more than an extra GB of disk savings for a semi-annual operation.
 - Minimum versions pinned (not exact) to avoid dependency conflicts.
 
@@ -106,7 +110,7 @@ pip install -r requirements.txt
 - [ ] `ollama list` shows `qwen2.5-coder:14b`
 - [ ] `ollama run qwen2.5-coder:14b "SELECT 1"` returns a response
 - [ ] `pip install -r requirements.txt` completes without errors
-- [ ] `python -c "import duckdb, langchain, streamlit, pyarrow, yaml; print('OK')"` prints OK
+- [ ] `python -c "import duckdb, langchain, chainlit, pyarrow, yaml; print('OK')"` prints OK
 - [ ] `python -c "import yaml; cfg = yaml.safe_load(open('config.yaml')); print(cfg['model']['name'])"` prints the model name
 
 ### Dependencies
@@ -353,7 +357,7 @@ Accept `chat_history` as a list of `(question, answer)` tuples. Include the last
 
 ### DuckDB Connection
 
-Open in **read-only** mode: `duckdb.connect(path, read_only=True)`. Prevents accidental writes and allows concurrent reads from the Streamlit app.
+Open in **read-only** mode: `duckdb.connect(path, read_only=True)`. Prevents accidental writes and allows concurrent reads from the Chainlit app.
 
 ### Acceptance Criteria
 - [ ] A simple query ("How many rows are in general payments 2024?") returns the correct count
@@ -368,83 +372,168 @@ Phase 0 (Ollama running, deps installed), Phase 1 (DuckDB populated with data an
 
 ---
 
-## Phase 3: Chat UI
+## Phase 3: Chat UI (Chainlit)
 
 ### Goal
-Build a Streamlit chat interface that accepts natural language questions, displays answers, generated SQL, result tables, and basic auto-generated charts.
+Build a professional, Amazon Q Business-like chat interface using **Chainlit** — a framework purpose-built for LLM applications. Users ask questions in plain English, see the agent's reasoning steps (SQL generation → execution → summarization) in real-time, and receive answers with data tables and interactive charts.
+
+### Why Chainlit over Streamlit
+
+| Aspect | Streamlit | Chainlit |
+|--------|-----------|----------|
+| **Architecture** | Full script reruns on every interaction | Event-driven, async — never freezes |
+| **Chat UX** | Chat components feel bolted-on | Purpose-built chat with threading, streaming |
+| **Agent visibility** | Manual expanders for SQL display | Native `@cl.step` shows agent reasoning as collapsible steps |
+| **Session management** | Manual `st.session_state` wiring | Built-in conversation history with resumable threads |
+| **LangChain integration** | Manual callbacks/generators | First-class decorators (`@cl.on_message`, `@cl.step`) |
+| **Visual polish** | Professional but dashboard-oriented | Modern chat UI comparable to Amazon Q / ChatGPT |
+| **Streaming** | Via generators (feels hacky) | Native `msg.stream_token()` |
+| **Code required** | ~200+ lines with manual state | ~150–200 lines, decorator-driven |
 
 ### What Gets Built
 
 | File | Purpose |
 |------|---------|
-| `app.py` | Streamlit chat UI (~200 lines) |
+| `app.py` | Chainlit chat application (~150–200 lines) |
+| `.chainlit/config.toml` | Chainlit-specific UI configuration (auto-generated on first run, then customized) |
 
-### Page Layout
-
-```python
-st.set_page_config(
-    page_title=config["ui"]["title"],
-    page_icon="🏥",
-    layout="wide",
-)
-```
-
-### Session State
+### Application Structure
 
 ```python
-st.session_state.messages    # list of {"role", "content", "sql", "data"}
-st.session_state.agent       # SQLAgent instance (initialized once)
+import chainlit as cl
+from agent import SQLAgent
+
+@cl.on_chat_start
+async def on_start():
+    """Initialize the agent when a new chat session begins."""
+    agent = SQLAgent("config.yaml")
+    cl.user_session.set("agent", agent)
+    cl.user_session.set("chat_history", [])
+
+    await cl.Message(
+        content="Welcome to the Open Payments Data Analyst. "
+                "Ask me anything about pharmaceutical and medical device "
+                "industry payments to physicians and hospitals (2021–2024)."
+    ).send()
+
+@cl.on_message
+async def on_message(message: cl.Message):
+    """Handle each user message."""
+    agent = cl.user_session.get("agent")
+    chat_history = cl.user_session.get("chat_history")
+
+    # Step 1: Generate SQL (visible as collapsible step)
+    async with cl.Step(name="Generating SQL", type="tool") as step:
+        result = await cl.make_async(agent.run_query)(
+            message.content, chat_history
+        )
+        if result["sql"]:
+            step.output = f"```sql\n{result['sql']}\n```"
+
+    # Step 2: Display results
+    if result.get("error"):
+        await cl.Message(content=f"Sorry, I couldn't answer that.\n\n**Error:** {result['error']}").send()
+    else:
+        # Build response with elements
+        elements = []
+
+        # Data table as a Text element
+        if result["data"] is not None and not result["data"].empty:
+            table_md = result["data"].head(config["ui"]["max_display_rows"]).to_markdown()
+            elements.append(cl.Text(name="Results", content=table_md, display="side"))
+
+            # Auto-generate chart if applicable
+            chart = generate_auto_chart(result["data"])
+            if chart:
+                elements.append(cl.Plotly(name="Chart", figure=chart, display="inline"))
+
+        await cl.Message(
+            content=result["answer"],
+            elements=elements
+        ).send()
+
+    # Update conversation history
+    chat_history.append((message.content, result.get("answer", "")))
+    cl.user_session.set("chat_history", chat_history[-5:])  # keep last 5
 ```
 
-### Chat Interface
+### Key Chainlit Features Used
 
-Using Streamlit's native chat components (`st.chat_message`, `st.chat_input`):
-
-- User message displayed immediately
-- Spinner shown while agent processes ("Analyzing your question...")
-- Assistant response shows:
-  - Natural language answer
-  - Expandable "Generated SQL" section (if `show_sql: true` in config)
-  - Data table (if results returned)
-  - Auto-generated chart (if applicable)
+| Feature | How It's Used |
+|---------|--------------|
+| **`@cl.on_chat_start`** | Initialize SQLAgent and DuckDB connection once per session |
+| **`@cl.on_message`** | Handle each user question — the main event loop |
+| **`cl.Step`** | Show "Generating SQL" and "Executing Query" as collapsible steps in the UI. Users can expand to see the generated SQL and execution details. |
+| **`cl.Message`** | Send the natural language answer back to the user |
+| **`cl.Text`** | Attach data tables (Markdown-formatted) as side-panel elements |
+| **`cl.Plotly`** | Attach interactive Plotly charts inline with the response |
+| **`cl.user_session`** | Store agent instance and conversation history per session (no manual state management) |
+| **`cl.make_async`** | Wrap synchronous agent calls to prevent UI blocking |
+| **Streaming** | For the summarization step, use `msg.stream_token()` to stream the LLM's natural language response token-by-token |
 
 ### Auto-Chart Heuristics
 
 | Result Shape | Chart Type |
 |-------------|------------|
-| 2 columns: 1 categorical + 1 numeric | Bar chart |
+| 2 columns: 1 categorical + 1 numeric | Horizontal bar chart |
 | 2+ columns with a year/date column + numeric | Line chart |
 | All other shapes | Table only (no auto-chart) |
 
-Use Plotly via `st.plotly_chart()` for interactive charts.
+Charts generated with Plotly and attached via `cl.Plotly` element.
 
-### Sidebar
+### Chainlit Configuration (`.chainlit/config.toml`)
 
-- Current model name and connection status (ping Ollama)
-- Database stats: table count, total rows (cached query)
-- "Clear Conversation" button
-- "Show SQL" toggle
+```toml
+[project]
+name = "Open Payments Data Analyst"
+enable_telemetry = false
+
+[UI]
+name = "Open Payments Data Analyst"
+description = "Ask questions about pharmaceutical payments to physicians (2021-2024)"
+default_theme = "dark"
+
+[features]
+prompt_playground = false
+multi_modal = false
+
+[UI.theme.dark]
+primary = "#3B82F6"
+background = "#1E1E1E"
+paper = "#2D2D2D"
+```
 
 ### Error Handling in UI
 
 | Scenario | User Sees |
 |----------|-----------|
-| Ollama not running | Error banner with setup instructions |
+| Ollama not running | Error message on chat start with setup instructions |
 | DuckDB file missing | Message directing user to run `python ingest.py` |
-| Agent returns error after retries | Error message + last attempted SQL |
+| Agent returns error after retries | Error message + last attempted SQL in a collapsible step |
 | LLM timeout | Timeout message with suggestion to simplify the question |
 
+Errors are caught in `@cl.on_chat_start` (startup checks) and `@cl.on_message` (query errors). No unhandled exceptions reach the user.
+
+### Launch Command
+
+```bash
+chainlit run app.py
+```
+
+Opens at `http://localhost:8000` by default. Port configurable in `.chainlit/config.toml`.
+
 ### Acceptance Criteria
-- [ ] `streamlit run app.py` launches and shows the chat interface
-- [ ] Typing a question returns an answer with SQL, data table, and chart (where applicable)
+- [ ] `chainlit run app.py` launches and shows a professional chat interface
+- [ ] Typing a question shows agent steps (SQL generation → execution) as collapsible sections
+- [ ] Answer displays with natural language summary, data table, and chart (where applicable)
 - [ ] Conversation history persists across messages within a session
-- [ ] Sidebar shows model name and database stats
-- [ ] "Clear Conversation" resets the chat
-- [ ] Ollama not running → informative error (not a crash)
-- [ ] DuckDB missing → informative error (not a crash)
+- [ ] Follow-up questions work correctly using conversation context
+- [ ] Ollama not running → informative error message (not a crash)
+- [ ] DuckDB missing → informative error message (not a crash)
+- [ ] UI does not freeze during long-running queries (async architecture)
 
 ### Dependencies
-Phase 0 (Streamlit installed), Phase 1 (DuckDB exists), Phase 2 (agent module).
+Phase 0 (Chainlit installed), Phase 1 (DuckDB exists), Phase 2 (agent module).
 
 ---
 
@@ -502,7 +591,7 @@ Common issues to watch for and fix:
 - Ollama connection errors handled (timeout, model not loaded)
 - Malformed LLM responses handled (no SQL found)
 - Configurable LLM timeout (default 120s)
-- Startup config validation in `app.py` (required keys exist, paths valid)
+- Startup config validation in `app.py` via `@cl.on_chat_start` (required keys exist, paths valid)
 
 ### Acceptance Criteria
 - [ ] 12+ of 15 test queries produce correct answers
@@ -522,13 +611,13 @@ These are out of scope for the initial build but documented for future planning.
 
 | Enhancement | Effort | Value | Description |
 |------------|--------|-------|-------------|
-| **Export results** | Low | High | `st.download_button()` for CSV/Excel download of query results |
+| **Export results** | Low | High | Chainlit `cl.File` element for CSV/Excel download of query results |
 | **Saved queries** | Medium | High | Pin frequently-used queries to sidebar. Store in JSON or DuckDB table. |
 | **Smart column selection** | Medium | High | Two-pass approach: LLM first identifies relevant tables/columns, then gets detailed schema. Improves accuracy on the 252-column Research table. |
 | **Data freshness check** | Low | Medium | Compare CSV dates vs Parquet dates. Warn in UI if CSVs are newer, suggesting re-ingest. |
 | **Alternative model providers** | Low | Medium | Implement provider abstraction in agent.py to support `openai` and `anthropic` providers from config (paid option for users who want it). |
 | **RAG over CMS docs** | High | Medium | Embed CMS methodology documents using local `nomic-embed-text` model + FAISS/ChromaDB. Answer policy-level questions beyond pure data queries. |
-| **Dashboard mode** | High | High | Separate Streamlit page with pinned auto-refreshing charts: payment trends, top companies, geographic distribution. |
+| **Dashboard mode** | High | High | Separate Chainlit page or custom element with pinned auto-refreshing charts: payment trends, top companies, geographic distribution. |
 | **Voice input** | Medium | Low | Whisper-based speech-to-text via local model for hands-free querying. |
 
 ---
@@ -554,7 +643,7 @@ These are out of scope for the initial build but documented for future planning.
 | `requirements.txt` | 0 | ~12 | Python dependencies |
 | `ingest.py` | 1 | ~150–200 | CSV → Parquet → DuckDB pipeline |
 | `agent.py` | 2 | ~200–250 | LLM agent: Text-to-SQL + summarization |
-| `app.py` | 3 | ~150–200 | Streamlit chat UI |
+| `app.py` | 3 | ~150–200 | Chainlit chat UI |
 | **Total** | | **~550–700** | |
 
 ---

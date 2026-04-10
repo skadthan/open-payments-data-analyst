@@ -45,7 +45,7 @@ User (Chat UI)  →  Agent Orchestrator  →  LLM (Ollama, local)
 - **DuckDB** — In-process analytical database. Queries 58.5M rows in milliseconds. CSV data is converted to Parquet (~4-6 GB compressed) for optimal performance.
 - **Ollama** — Local model server with OpenAI-compatible API. Runs quantized open-source models on GPU. Swap models via config.
 - **LangChain** — Agent framework for Text-to-SQL generation, self-correction, and result summarization.
-- **Streamlit** — Simple chat interface with table and chart display.
+- **Chainlit** — Professional chat interface purpose-built for LLM apps, with streaming, agent step visibility, and interactive charts.
 
 See [to-be-architecture-plan.md](to-be-architecture-plan.md) for the full architecture design, model recommendations, and implementation details.
 
@@ -75,7 +75,7 @@ pip install -r requirements.txt
 python ingest.py
 
 # 4. Launch
-streamlit run app.py
+chainlit run app.py
 ```
 
 ## Project Structure
@@ -92,7 +92,7 @@ streamlit run app.py
 ├── config.yaml               # Application configuration (TBD)
 ├── ingest.py                 # Data ingestion pipeline (TBD)
 ├── agent.py                  # LLM agent orchestrator (TBD)
-├── app.py                    # Streamlit chat UI (TBD)
+├── app.py                    # Chainlit chat UI (TBD)
 └── requirements.txt          # Python dependencies (TBD)
 ```
 

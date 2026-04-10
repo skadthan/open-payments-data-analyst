@@ -41,7 +41,7 @@ This hardware comfortably supports a quantized 14B-parameter model on GPU while 
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                   Streamlit Chat UI                      │
+│                   Chainlit Chat UI                      │
 │         (simple chat, table display, basic charts)       │
 └──────────────────────┬──────────────────────────────────┘
                        │  user question / conversation
@@ -88,7 +88,7 @@ This hardware comfortably supports a quantized 14B-parameter model on GPU while 
 | **Parquet over raw CSV** | Columnar storage with compression: 33 GB → 4–6 GB. DuckDB reads Parquet natively. Orders of magnitude faster for analytical queries. |
 | **Ollama as model server** | Standard OpenAI-compatible API. Swap models with one config change. Automatic GPU offloading. Every LLM framework integrates natively. |
 | **LangChain orchestrator** | Mature agent framework with built-in SQL agent tooling, retry logic, and conversation memory. Avoids reinventing the wheel. |
-| **Streamlit UI** | Chat interface in ~200 lines of Python. Built-in table/chart rendering. No frontend build step. |
+| **Chainlit UI** | Professional LLM chat interface in ~150–200 lines of Python. Native streaming, agent step visibility, table/chart rendering. No frontend build step. |
 | **Single YAML config** | One file controls model, data paths, UI settings. Swap LLM providers or models without touching code. |
 
 ---
@@ -157,7 +157,7 @@ ui:
 | `config.yaml` | All application settings | ~20 lines |
 | `ingest.py` | CSV → Parquet conversion, DuckDB schema registration, data dictionary loading | ~150 lines |
 | `agent.py` | LLM agent: schema-aware prompt building, Text-to-SQL, self-correction loop, result summarization | ~200 lines |
-| `app.py` | Streamlit chat UI with conversation history, table/chart display | ~200 lines |
+| `app.py` | Chainlit chat UI with conversation history, agent steps, table/chart display | ~150–200 lines |
 | `requirements.txt` | Python dependencies | ~10 lines |
 
 ---
@@ -212,13 +212,13 @@ pip install -r requirements.txt
 python ingest.py
 
 # 5. Launch the app
-streamlit run app.py
+chainlit run app.py
 ```
 
 ### Python Dependencies
 
 ```
-streamlit>=1.30
+chainlit>=1.1
 duckdb>=0.10
 langchain>=0.2
 langchain-community>=0.2
