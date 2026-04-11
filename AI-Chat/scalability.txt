@@ -40,3 +40,23 @@
     Ollama with a hosted inference endpoint first (that's the real bottleneck), and then revisit whether Chainlit or a custom FastAPI + React frontend makes sense.
 
     For your current scope, don't worry about it. Ship the MVP.
+
+    also, It won't be just for single user but I may have to expact this to 5-10 users, probably usign shared host
+
+● Good signal — 5-10 users on a shared host changes a few things but not dramatically. Here's what matters:
+
+  What already works for multi-user:
+  - DuckDB read-only mode (agent.py:258) — multiple processes/threads can read concurrently, no changes needed.
+  - Chainlit sessions — each user gets isolated cl.user_session state, including chat history, out of the box.
+
+  What needs attention:
+
+  1. Ollama is your real bottleneck. One Qwen2.5-Coder-14B instance serves requests serially (queued). With 10 users hitting it at once, the 10th user could wait 30–60+ seconds just for their turn. Options: (a) accept the queue, (b) run multiple Ollama instances behind
+  a load balancer, (c) switch to a hosted API (Anthropic/OpenAI) for multi-user — far simpler than scaling local inference.
+  2. Agent instance lifecycle — check whether app.py builds one SQLAgent per session or reuses one globally. A single shared agent is fine (DuckDB connection is read-only, prompts are stateless) and much cheaper than 10 copies. Worth verifying.
+  3. Authentication — Chainlit has built-in auth (password, header, OAuth). For 5-10 users on a shared host you need something, even if it's a shared password or a small user list.
+  4. Host sizing — VRAM is the binding constraint. ~10 GB for the model + whatever the OS/DuckDB needs. A single GPU host handles it; CPU-only inference will be too slow for interactive use at this user count.
+  5. Deployment shape — Chainlit ships as a uvicorn/FastAPI app. Put it behind nginx/Caddy with TLS; run it under systemd or Docker. Nothing exotic.
+
+  My recommendation: the single biggest question is local Ollama vs. hosted API. For 5-10 users doing interactive analytics, a hosted API (Claude Haiku or Sonnet) will be dramatically faster, cheaper than provisioning a GPU host, and eliminates the queueing problem
+  entirely — at the cost of per-query API fees and sending query text (not data) to a third party. Is that tradeoff acceptable for your use case? That answer shapes the rest of Phase 5.
