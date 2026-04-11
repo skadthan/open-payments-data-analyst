@@ -169,6 +169,12 @@ Total rows in the full result: {total_rows}
 
 Write a concise 2-4 sentence answer in plain English. Reference specific numbers
 from the data when relevant. Do not make up values. Do not restate the SQL.
+
+Formatting rules for numbers in your answer:
+- Format dollar amounts as $1.2M, $834K, or $1,234,567 — never as raw
+  decimals like 1234567.0 or 2345678.89.
+- Format percentages as 42.3%, not 0.423.
+- Thousands separators (commas) on all large integers.
 """
 
 FOLLOWUP_PROMPT_TEMPLATE = """\
@@ -423,6 +429,11 @@ class SQLAgent:
         error_context: str | None = None
         last_sql: str | None = None
         last_err: str | None = None
+        # Per-attempt history of failed tries: [(sql, error_message), ...].
+        # The final successful attempt is NOT appended — only the failures
+        # that preceded it, so the UI can show "first try failed, here's why,
+        # retry succeeded." Kept short (first line of error) to stay readable.
+        attempt_history: list[tuple[str | None, str]] = []
         total_attempts = self.max_retries + 1
 
         for attempt in range(1, total_attempts + 1):
@@ -430,7 +441,8 @@ class SQLAgent:
                 sql = self._generate_sql(question, error_context, chat_history)
             except Exception as e:
                 return self._error_result(
-                    question, None, f"LLM call failed: {e}", attempt, start
+                    question, None, f"LLM call failed: {e}",
+                    attempt, start, attempt_history,
                 )
 
             last_sql = sql
@@ -438,6 +450,7 @@ class SQLAgent:
             if not sql:
                 error_context = "You returned an empty response. Return valid DuckDB SQL."
                 last_err = "empty LLM response"
+                attempt_history.append((None, last_err))
                 continue
 
             if sql.strip().lower().startswith("select 'unsupported'"):
@@ -448,6 +461,7 @@ class SQLAgent:
                     "canned_answer": UNSUPPORTED_MESSAGE,
                     "error": None,
                     "attempts": attempt,
+                    "attempt_history": attempt_history,
                     "elapsed_sec": time.perf_counter() - start,
                 }
 
@@ -455,6 +469,7 @@ class SQLAgent:
                 df = self.con.execute(sql).fetchdf()
             except Exception as e:
                 last_err = str(e)
+                attempt_history.append((sql, last_err))
                 error_context = (
                     f"Your previous SQL failed with this DuckDB error:\n{e}\n\n"
                     f"Previous SQL was:\n{sql}\n\n"
@@ -470,11 +485,13 @@ class SQLAgent:
                 "canned_answer": canned,
                 "error": None,
                 "attempts": attempt,
+                "attempt_history": attempt_history,
                 "elapsed_sec": time.perf_counter() - start,
             }
 
         return self._error_result(
-            question, last_sql, last_err or "unknown error", total_attempts, start
+            question, last_sql, last_err or "unknown error",
+            total_attempts, start, attempt_history,
         )
 
     def run_query(
@@ -513,6 +530,7 @@ class SQLAgent:
         err: str,
         attempts: int,
         start: float,
+        attempt_history: list[tuple[str | None, str]] | None = None,
     ) -> dict[str, Any]:
         return {
             "question": question,
@@ -521,6 +539,7 @@ class SQLAgent:
             "answer": None,
             "error": err,
             "attempts": attempts,
+            "attempt_history": attempt_history or [],
             "elapsed_sec": time.perf_counter() - start,
         }
 

@@ -8,3 +8,4 @@ ollama>=0.3
 pyyaml>=6.0
 plotly>=5.18
 pandas>=2.0
+openpyxl>=3.1

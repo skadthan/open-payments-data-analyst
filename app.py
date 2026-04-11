@@ -21,6 +21,16 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+_FROM_TABLE_RE = re.compile(r"\bFROM\s+([A-Za-z_][A-Za-z0-9_]*)", re.IGNORECASE)
+
+
+def _first_from_table(sql: str | None) -> str | None:
+    """Return the first `FROM <table>` identifier in a SQL string, or None."""
+    if not sql:
+        return None
+    m = _FROM_TABLE_RE.search(sql)
+    return m.group(1) if m else None
+
 import chainlit as cl
 import pandas as pd
 import plotly.express as px
@@ -170,6 +180,25 @@ def _write_full_csv(df: pd.DataFrame, question: str) -> Path:
     return path
 
 
+def _write_full_xlsx(df: pd.DataFrame, question: str) -> Path | None:
+    """Write the full result to a temp .xlsx file and return the path.
+
+    Returns None if openpyxl is not installed — callers should treat a
+    None return as "no Excel export this session" and fall back to CSV
+    only. Adding openpyxl to requirements.txt and reinstalling enables
+    this without any code change.
+    """
+    try:
+        import openpyxl  # noqa: F401 — imported for availability check
+    except ImportError:
+        return None
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    name = f"openpayments-{_slugify(question)}-{stamp}.xlsx"
+    path = Path(tempfile.gettempdir()) / name
+    df.to_excel(path, index=False, engine="openpyxl")
+    return path
+
+
 def _build_response_elements(result: dict[str, Any]) -> list:
     """Assemble the table + (optional) chart + CSV download for a successful result."""
     elements: list = []
@@ -190,7 +219,8 @@ def _build_response_elements(result: dict[str, Any]) -> list:
 
     # Full-result CSV download. Always attached, even when the inline
     # table is not truncated, so the demo has a consistent export affordance.
-    csv_path = _write_full_csv(df, result.get("question") or "query")
+    question = result.get("question") or "query"
+    csv_path = _write_full_csv(df, question)
     elements.append(
         cl.File(
             name=f"Download CSV ({len(df):,} rows)",
@@ -199,6 +229,20 @@ def _build_response_elements(result: dict[str, Any]) -> list:
             display="inline",
         )
     )
+
+    # R3.4 — Excel export alongside CSV. Silently skipped if openpyxl
+    # is not installed; analysts in a healthcare/compliance setting
+    # expect an .xlsx download.
+    xlsx_path = _write_full_xlsx(df, question)
+    if xlsx_path is not None:
+        elements.append(
+            cl.File(
+                name=f"Download Excel ({len(df):,} rows)",
+                path=str(xlsx_path),
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                display="inline",
+            )
+        )
 
     return elements
 
@@ -273,8 +317,36 @@ async def _answer_question(question: str) -> None:
     # Step 1: SQL generation + execution (visible as a collapsible step).
     async with cl.Step(name="Generating SQL", type="tool") as step:
         prep = await cl.make_async(agent.prepare)(question, chat_history)
-        if prep.get("sql"):
+
+        # R3.2 — visible self-correction. When the retry loop kicked in
+        # (attempts > 1), show each failed attempt + its DuckDB error,
+        # then the final (successful or last-tried) SQL. When it didn't,
+        # fall back to the original single-block render.
+        history: list[tuple[str | None, str]] = prep.get("attempt_history") or []
+        if history:
+            chunks: list[str] = []
+            for i, (bad_sql, err) in enumerate(history, start=1):
+                first_line = (err or "").splitlines()[0][:200] if err else "empty response"
+                if bad_sql:
+                    chunks.append(
+                        f"**Attempt {i} — failed:** {first_line}\n"
+                        f"```sql\n{bad_sql}\n```"
+                    )
+                else:
+                    chunks.append(f"**Attempt {i} — failed:** {first_line}")
+            if prep.get("sql") and not prep.get("error"):
+                chunks.append(
+                    f"**Attempt {len(history) + 1} — succeeded ✓**\n"
+                    f"```sql\n{prep['sql']}\n```"
+                )
+            elif prep.get("sql"):
+                chunks.append(
+                    f"**Last SQL tried:**\n```sql\n{prep['sql']}\n```"
+                )
+            step.output = "\n\n".join(chunks)
+        elif prep.get("sql"):
             step.output = f"```sql\n{prep['sql']}\n```"
+
         if prep.get("error"):
             prev = step.output or ""
             step.output = (
@@ -340,6 +412,20 @@ async def _answer_question(question: str) -> None:
             )
             parts = [fallback]
             msg.content = fallback
+
+        # R3.1 + R3.6 — performance and provenance footer, appended to
+        # every successful streamed summary. One block so it renders as
+        # a single muted section under the narrative answer.
+        elapsed = prep.get("elapsed_sec") or 0.0
+        table = _first_from_table(prep.get("sql"))
+        footer_parts = [f"⚡ Answered in **{elapsed:.1f}s**"]
+        if table:
+            footer_parts.append(
+                f"Source: `{table}` · **{len(df):,}** rows matched"
+            )
+        footer = "\n\n---\n" + " · ".join(footer_parts)
+        msg.content += footer
+        parts.append(footer)
 
         # Row-truncation notice appended after the streamed summary.
         max_rows = int(CONFIG["ui"]["max_display_rows"])
