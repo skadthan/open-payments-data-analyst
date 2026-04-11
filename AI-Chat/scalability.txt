@@ -1,0 +1,42 @@
+ /btw is chainlint scalable, in case more users wants to use this tool?
+
+    Chainlit scalability — the honest answer
+
+    For this project as designed: not really. Chainlit is a great choice for the MVP we're building, but it has real ceilings if you imagine many concurrent users.
+
+    What limits scaling
+
+    1. The LLM is the actual bottleneck, not Chainlit. Your local Ollama + Qwen2.5-Coder 14B serves one query at a time on one machine. Even 5 concurrent users will queue behind each other (~5–18s per query). Chainlit could be infinitely scalable and you'd still hit
+    this wall first.
+    2. One DuckDB connection per session. Each Chainlit session opens its own read-only DuckDB connection. That's fine for tens of users, but file-based DuckDB isn't a multi-tenant database — there's no connection pool, no query queue, no resource isolation.
+    3. cl.make_async uses a thread pool. The synchronous agent.run_query runs on anyio's default thread pool (~40 threads). Long-running queries pin threads.
+    4. Single-process by default. chainlit run app.py is one uvicorn worker. You can scale workers (--workers N), but Chainlit's session state lives in worker memory, so a load balancer needs sticky sessions.
+    5. nest_asyncio dependency. Chainlit's reliance on nest_asyncio (the very thing causing the current Python 3.14 bug) signals that its async architecture has rough edges that fight you under load.
+
+    What Chainlit does handle reasonably
+
+    - Async/event-driven architecture (no Streamlit-style full-page reruns)
+    - Per-session WebSocket connections — fine for dozens of concurrent chatters
+    - Built-in conversation persistence (optional, via Literal AI or Postgres)
+    - Horizontal scaling is technically possible with a Redis-backed session store and a load balancer
+
+    Practical scaling tiers for this project
+
+    ┌──────────────────────────────┬───────────────────┬─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+    │            Users             │   Works as-is?    │                                                                     What you'd need                                                                     │
+    ├──────────────────────────────┼───────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+    │ 1–5 (you + a few colleagues) │ ✅ Yes            │ Nothing — current design is fine                                                                                                                        │
+    ├──────────────────────────────┼───────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+    │ 5–50 (small team)            │ ⚠️ Maybe          │ Move Ollama to a dedicated GPU box; consider a query queue                                                                                              │
+    ├──────────────────────────────┼───────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+    │ 50–500                       │ ❌ No             │ Swap Ollama for a hosted inference API (vLLM cluster, Anthropic, OpenAI), Postgres for sessions, multiple uvicorn workers behind nginx, sticky sessions │
+    ├──────────────────────────────┼───────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+    │ 500+                         │ ❌ Definitely not │ Rethink architecture — Chainlit isn't designed for this. Look at FastAPI + a custom React frontend, or a managed platform                               │
+    └──────────────────────────────┴───────────────────┴─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+    Bottom line
+
+    Chainlit is the right tool for "an analyst-facing internal tool used by a handful of people" — which matches the project's stated goal. If you ever need to expose this to hundreds of users, the right move isn't to scale Chainlit harder, it's to replace the local
+    Ollama with a hosted inference endpoint first (that's the real bottleneck), and then revisit whether Chainlit or a custom FastAPI + React frontend makes sense.
+
+    For your current scope, don't worry about it. Ship the MVP.
