@@ -19,7 +19,7 @@
     var link = document.createElement("link");
     link.rel = "icon";
     link.type = "image/png";
-    link.href = "/public/openpayments-avatar.png";
+    link.href = "/public/favicon.png";
     document.head.appendChild(link);
 
     document.title = "CMS Open Payments Data Analyst";
