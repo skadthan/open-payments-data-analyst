@@ -1,0 +1,61 @@
+/*
+ * CMS Open Payments Data Analyst — brand overrides.
+ *
+ * Targets the Chainlit frontend CSS variables with USWDS-aligned
+ * colors. Primary is USWDS "primary" #005ea2 (CMS / HHS gov blue).
+ * Accent is USWDS "primary-vivid" #0050d8.
+ *
+ * If the client provides exact CMS brand hex values later, swap them
+ * in here — no code changes required.
+ */
+
+:root {
+  --primary: #005ea2;
+  --primary-foreground: #ffffff;
+  --accent: #0050d8;
+  --ring: #005ea2;
+}
+
+/* Light-mode header and send button */
+html[data-theme="light"] {
+  --background: #ffffff;
+  --foreground: #1b1b1b;
+  --primary: #005ea2;
+  --primary-foreground: #ffffff;
+  --accent: #0050d8;
+  --border: #dfe1e2;
+}
+
+/* Dark-mode variant — keep the brand blue but lighten for contrast */
+html[data-theme="dark"] {
+  --primary: #3d8fc6;
+  --primary-foreground: #ffffff;
+  --accent: #5aa3e0;
+}
+
+/* Make the top navbar adopt the brand blue in light mode */
+html[data-theme="light"] header,
+html[data-theme="light"] nav[aria-label="Header"] {
+  background-color: #005ea2;
+  color: #ffffff;
+}
+
+html[data-theme="light"] header a,
+html[data-theme="light"] header button {
+  color: #ffffff;
+}
+
+/* Nudge starter buttons toward the brand palette */
+button[data-test-id^="starter-"] {
+  border-color: #005ea2;
+}
+
+button[data-test-id^="starter-"]:hover {
+  background-color: rgba(0, 94, 162, 0.08);
+}
+
+/* Tighten the font stack toward a gov-style sans */
+body, .cl-markdown {
+  font-family: "Source Sans Pro", "Segoe UI", system-ui, -apple-system,
+               sans-serif;
+}

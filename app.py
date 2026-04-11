@@ -195,6 +195,7 @@ def _build_response_elements(result: dict[str, Any]) -> list:
         cl.File(
             name=f"Download CSV ({len(df):,} rows)",
             path=str(csv_path),
+            mime="text/csv",
             display="inline",
         )
     )
@@ -246,8 +247,10 @@ async def on_chat_start() -> None:
     cl.user_session.set("agent", agent)
     cl.user_session.set("chat_history", [])
 
-    await cl.Message(content=GREETING).send()
-
+    # Intentionally no greeting bubble: sending any message here collapses
+    # the Chainlit starter landing (logo + starter buttons) into chat mode.
+    # The logo + starters ARE the landing. Stale-data warning is the one
+    # exception — it only fires when the DuckDB file is out of date.
     stale_warning = _check_data_freshness()
     if stale_warning:
         await cl.Message(content=stale_warning).send()
