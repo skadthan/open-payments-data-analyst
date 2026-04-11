@@ -152,7 +152,32 @@ Rules:
 8. Name and string filters: NEVER use case-sensitive `=` on name columns (first name, last name, company name, drug name, hospital name, city, specialty). Always use `ILIKE` so the user does not have to guess the stored casing. For exact-name lookups, use `ILIKE 'value'`; for partial matches, use `ILIKE '%value%'`. This applies to BOTH single-column filters and multi-column filters (e.g. first name AND last name).
 9. State columns (Recipient_State, Principal_Investigator_1_State, Applicable_Manufacturer_or_Applicable_GPO_Making_Payment_State) store **2-character USPS state codes** ('CA', 'TX', 'NY', 'FL', 'NJ', 'PA', 'IL', 'OH', 'MA', 'GA', 'WA', 'CO', 'MI', 'MN', 'NC', 'VA', 'AZ', 'MD', 'MO', 'TN', 'IN', 'WI', 'OR', 'CT', 'SC', 'KY', 'OK', 'LA', 'AL', 'IA', 'UT', 'NV', 'AR', 'MS', 'KS', 'NM', 'NE', 'ID', 'HI', 'ME', 'NH', 'MT', 'RI', 'DE', 'SD', 'ND', 'AK', 'VT', 'WY', 'WV', 'DC', 'PR'), NEVER full state names. When the user mentions a state by name (e.g. "California", "New York"), you MUST convert it to its 2-letter USPS code in the SQL filter. Example: `Recipient_State ILIKE 'CA'` — NOT `Recipient_State ILIKE 'California'`. Use ILIKE on state columns too so the casing is irrelevant.
 10. Specialty columns (Covered_Recipient_Specialty_1, Physician_Specialty, Principal_Investigator_1_Specialty_1) are stored in the format `Provider Taxonomy|Specialty|Subspecialty`, e.g. `'Allopathic & Osteopathic Physicians|Orthopaedic Surgery'` or `'Allopathic & Osteopathic Physicians|Orthopaedic Surgery|Sports Medicine'`. When the user mentions a specialty by its short name (e.g. "Orthopaedic Surgery", "Internal Medicine", "Cardiology"), you MUST use a partial-match ILIKE with wildcards so the taxonomy prefix and any subspecialty suffix are tolerated. Example: `Covered_Recipient_Specialty_1 ILIKE '%Orthopaedic Surgery%'` — NOT `ILIKE 'Orthopaedic Surgery'`. Only use an exact ILIKE on a specialty column if the user literally supplied the full `Taxonomy|Specialty` string.
-11. If the question is unrelated to CMS Open Payments AND the chat history shows no prior on-topic exchange, respond with exactly: SELECT 'unsupported' AS note;
+11. Manufacturer / GPO / company filters MUST use wildcard ILIKE, not exact ILIKE. Company names are stored with legal suffixes like `'Arthrex, Inc.'`, `'Zimmer Biomet Holdings, Inc.'`, `'Pfizer Inc.'`, `'Johnson & Johnson Services, Inc.'`. When the user mentions a company by its short name (e.g. "Arthrex", "Pfizer", "Zimmer"), you MUST use `Applicable_Manufacturer_or_Applicable_GPO_Making_Payment_Name ILIKE '%Arthrex%'` — NEVER `ILIKE 'Arthrex'`. The same rule applies to Submitting_Applicable_Manufacturer_or_Applicable_GPO_Name if you ever reference it.
+12. The product column `Name_of_Drug_or_Biological_or_Device_or_Medical_Supply_1` is **dirty**. When the user asks for "top products", "highest-paying drugs", "most paid-for devices", or similar (i.e. the question is ABOUT which products/drugs/devices received payments), you MUST copy this exact pattern — do not omit any guard:
+
+    ```sql
+    SELECT
+        MAX(Name_of_Drug_or_Biological_or_Device_or_Medical_Supply_1) AS product,
+        SUM(Total_Amount_of_Payment_USDollars) AS total_payments
+    FROM <table>
+    WHERE <user filters>
+      -- Guard A: ~60% of rows have NULL product (meals, travel, consulting — not tied to a product)
+      AND Name_of_Drug_or_Biological_or_Device_or_Medical_Supply_1 IS NOT NULL
+      -- Guard B: some rows have the manufacturer name leaked into the product column
+      -- (e.g. product='Arthrex' when manufacturer='Arthrex, Inc.'). Exclude by containment,
+      -- because equality fails when the manufacturer has a legal suffix ("Inc.", "Corp.", etc).
+      AND LENGTH(Name_of_Drug_or_Biological_or_Device_or_Medical_Supply_1) >= 3
+      AND UPPER(Applicable_Manufacturer_or_Applicable_GPO_Making_Payment_Name)
+          NOT LIKE '%' || UPPER(Name_of_Drug_or_Biological_or_Device_or_Medical_Supply_1) || '%'
+    -- Guard C: collapse casing duplicates (e.g. 'Arthrex' vs 'ARTHREX', 'Attune' vs 'ATTUNE').
+    -- ALWAYS GROUP BY UPPER(product), never by the raw column, or duplicates will split rows.
+    GROUP BY UPPER(Name_of_Drug_or_Biological_or_Device_or_Medical_Supply_1)
+    ORDER BY total_payments DESC
+    LIMIT 100;
+    ```
+
+    All three guards (A, B, C) are required together — omitting any one produces misleading results. This rule applies ONLY when the user is asking ABOUT products/drugs/devices. If the user is filtering BY a known product name (e.g. "how much was spent on Humira?") or asking about something unrelated (payment types, specialties, manufacturers), ignore this rule.
+13. If the question is unrelated to CMS Open Payments AND the chat history shows no prior on-topic exchange, respond with exactly: SELECT 'unsupported' AS note;
    However, if the chat history shows the user is refining, retrying, or follow-up-asking about a prior on-topic question (e.g. "try case-insensitive", "what about 2023?", "show me the chart"), treat the new question as on-topic and answer it.
 """
 
@@ -171,6 +196,16 @@ Total rows in the full result: {total_rows}
 
 Write a concise 2-4 sentence answer in plain English. Reference specific numbers
 from the data when relevant. Do not make up values. Do not restate the SQL.
+
+Accuracy rules:
+- Product/drug/device names and manufacturer/company names are DIFFERENT columns
+  and often different things. Never describe a company name (e.g. "Arthrex",
+  "Pfizer", "Zimmer") as if it were a product. If a result row's product label
+  looks like a company, treat it as ambiguous data and either skip it or call it
+  out as "unspecified product (company name in product field)" — do NOT pluralize
+  it into a fake product category like "Arthrex products".
+- Only describe what the rows literally contain. Do not invent categories that
+  aren't in the data.
 
 Formatting rules for numbers in your answer:
 - Format dollar amounts as $1.2M, $834K, or $1,234,567 — never as raw
