@@ -43,9 +43,10 @@ make this layer feel fast and trustworthy.
 | File | Purpose |
 |------|---------|
 | `app.py` | Chainlit chat application (~200 lines) |
+| `run.py` | Wrapper launcher — works around a Python 3.14 + `nest_asyncio` + chainlit incompatibility (see "Observed issues" below). **Use `python run.py` instead of `chainlit run app.py`.** |
 | `phase-3-plan.md` | This document |
 
-Nothing else. No new helpers, no new config keys.
+No new config keys, no new agent-side helpers.
 
 ---
 
@@ -61,7 +62,7 @@ app.py
 ├── _build_sql_step(...)             — show generated SQL as a cl.Step
 ├── _build_response_elements(...)    — assemble Dataframe + optional chart
 ├── _auto_chart(df) -> Figure | None — heuristic chart generator
-└── (no CLI — chainlit run app.py is the only entry point)
+└── (no CLI — `python run.py` is the entry point)
 ```
 
 ### Why `_load_config` runs at import time
@@ -293,7 +294,7 @@ without locking each other out.
 
 ## Acceptance criteria
 
-- [x] `chainlit run app.py` launches without errors and serves HTTP (verified on `:8765` headless)
+- [x] `python run.py --headless --port N` launches without errors and serves HTTP (verified after the `nest_asyncio` workaround — both `/` and `/favicon` return HTTP 200)
 - [ ] The greeting renders with the example questions *(needs browser)*
 - [ ] Asking a simple count question shows the SQL step expanding to the generated SQL, the natural-language answer, and a `cl.Dataframe` element *(needs browser)*
 - [x] Asking a top-10 question renders a horizontal bar chart *(unit-tested via `_auto_chart`)*
@@ -312,7 +313,8 @@ without locking each other out.
 | Check | Result |
 |-------|--------|
 | `app.py` parses (AST) and imports cleanly under the project venv | ✅ |
-| `chainlit run app.py --headless --port 8765` boots cleanly on first try | ✅ — `Your app is available at http://localhost:8765` within 1 second |
+| `python run.py --headless --port 8830` boots cleanly via the `nest_asyncio` workaround | ✅ — `Your app is available at http://localhost:8830` within 1 second |
+| `GET /favicon` returns HTTP 200 (was 500 before the fix — `anyio.NoEventLoopError`) | ✅ — confirmed 6455-byte favicon body |
 | `GET /` returns HTTP 200 (1434-byte HTML shell) | ✅ |
 | `POST /project/settings` returns HTTP 200 (handlers registered) | ✅ |
 | Chainlit auto-generated `chainlit.md` on first run, then we customized it | ✅ |
@@ -323,7 +325,7 @@ without locking each other out.
 
 ### What still needs human eyeballs in a browser
 
-These can only be verified by `chainlit run app.py` and clicking around — they
+These can only be verified by `python run.py` and clicking around — they
 exercise React rendering, WebSocket message flow, and the Step expand/collapse
 UX that has no programmatic equivalent:
 
@@ -341,6 +343,7 @@ UX that has no programmatic equivalent:
 | **pandas 2.x StringDtype default** | `_auto_chart` rejected the top-10 companies case (`dtypes['Company'] == object` was False because the column was `StringDtype(na_value=nan)`, not `object`). Result: bar charts never fired for any string-keyed top-N query. | Switched the categorical detection to `pd.api.types.is_string_dtype(dtypes[c]) and not pd.api.types.is_numeric_dtype(...)`. Re-ran all 5 chart cases — all correct. |
 | **`cl.Dataframe` requires Chainlit context to instantiate** | Trying to unit-test `_build_response_elements` outside a chat session crashes with `ChainlitContextException` because `Field(default_factory=lambda: context.session.thread_id)` runs at construction time. | Acknowledged limitation: the element-building path can only be exercised inside a real Chainlit session. Documented in this section so future maintainers don't try the same dead-end. |
 | **`chainlit.md` auto-generated on first run** | First `chainlit run` created a generic Chainlit welcome page at the project root (not under the gitignored `.chainlit/`). | Customized `chainlit.md` with project-specific copy and example questions, then committed it as part of Phase 3. |
+| **🚨 Blank screen on first browser load (Python 3.14 + nest_asyncio + chainlit)** | `chainlit run app.py` boots cleanly, the root HTML loads, but every static frontend asset (`/favicon`, `/logo`, JS/CSS bundles) returns HTTP 500 with `anyio.NoEventLoopError: Not currently running on any asynchronous event loop`. The browser shows a blank page. The smoke test missed this because curl-ing `/` never triggers the FileResponse path. | **Root cause:** `chainlit/cli/__init__.py:11` unconditionally calls `nest_asyncio.apply()`. On Python 3.14 that monkey-patch breaks `asyncio.current_task()` (returns `None` inside running tasks), which makes `sniffio.current_async_library()` raise, which makes `anyio.to_thread.run_sync` raise inside `starlette.responses.FileResponse.__call__`, which 500-errors every static asset. **Bisect path:** narrowed via successive minimal reproductions — plain FastAPI + FileResponse worked, plain `asyncio.run(server.serve())` worked, even `from chainlit.server import app` worked, but `chainlit.cli.load_module('app.py')` reproduced because importing `chainlit.cli` runs `nest_asyncio.apply()` at module top-level. **`nest_asyncio` 1.6.0 is the latest release** and the project is effectively unmaintained — no upstream fix is coming. Neither chainlit nor this app actually need nested-loop support. **Fix:** added `run.py`, a tiny wrapper that pre-imports `nest_asyncio`, replaces `apply` with `lambda: None`, and then hands off to `chainlit.cli`. Users now launch with `python run.py` instead of `chainlit run app.py`. After the fix, `/favicon` and `/logo` both return HTTP 200. |
 
 ---
 

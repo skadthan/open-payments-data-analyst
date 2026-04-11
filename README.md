@@ -75,8 +75,14 @@ pip install -r requirements.txt
 python ingest.py
 
 # 4. Launch
-chainlit run app.py
+python run.py
 ```
+
+> **Note:** Use `python run.py`, not `chainlit run app.py` directly. The
+> wrapper neutralizes a `nest_asyncio.apply()` call inside chainlit's CLI
+> that breaks `asyncio.current_task()` on Python 3.14 and leaves the
+> browser with a blank screen. See `phase-3-plan.md` "Observed issues
+> and fixes" for the full bisect.
 
 ## Project Structure
 
