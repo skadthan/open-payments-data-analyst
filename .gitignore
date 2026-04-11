@@ -36,6 +36,10 @@ raw/
 # Chainlit runtime session data (uploaded files, transient state)
 .files/
 
+# chainlit.md is rendered from chainlit.md.template at run.py startup
+# with live DuckDB COUNT(*) values. The template is the source of truth.
+chainlit.md
+
 # Auto-generated tool scaffolding — but keep the config and brand assets
 .chainlit/*
 !.chainlit/config.toml

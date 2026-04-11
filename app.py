@@ -199,6 +199,102 @@ def _write_full_xlsx(df: pd.DataFrame, question: str) -> Path | None:
     return path
 
 
+def _write_session_pdf(session_log: list[dict[str, Any]]) -> Path | None:
+    """Render the full session Q/A log to a temp PDF and return the path.
+
+    Returns None if reportlab is not installed OR the session log is
+    empty. The demo affordance is "take this analysis home" — each
+    entry includes the question, generated SQL, and plain-English
+    answer. Designed for a compliance-minded audience, so we lean
+    toward auditability (SQL visible, timestamp per Q).
+    """
+    if not session_log:
+        return None
+    try:
+        from reportlab.lib.pagesizes import LETTER
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.units import inch
+        from reportlab.lib.enums import TA_LEFT
+        from reportlab.platypus import (
+            SimpleDocTemplate,
+            Paragraph,
+            Spacer,
+            Preformatted,
+            PageBreak,
+        )
+    except ImportError:
+        return None
+
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    path = Path(tempfile.gettempdir()) / f"openpayments-session-{stamp}.pdf"
+
+    styles = getSampleStyleSheet()
+    h1 = styles["Heading1"]
+    h2 = styles["Heading2"]
+    body = styles["BodyText"]
+    meta = ParagraphStyle(
+        "meta",
+        parent=body,
+        fontSize=8,
+        textColor="#666666",
+        spaceAfter=8,
+        alignment=TA_LEFT,
+    )
+    mono = ParagraphStyle(
+        "mono",
+        parent=body,
+        fontName="Courier",
+        fontSize=8,
+        leading=10,
+        leftIndent=12,
+        textColor="#222222",
+    )
+
+    doc = SimpleDocTemplate(
+        str(path),
+        pagesize=LETTER,
+        leftMargin=0.75 * inch,
+        rightMargin=0.75 * inch,
+        topMargin=0.75 * inch,
+        bottomMargin=0.75 * inch,
+        title="CMS Open Payments — Session Report",
+    )
+
+    story: list = []
+    story.append(Paragraph("CMS Open Payments — Session Report", h1))
+    story.append(Paragraph(
+        f"Generated {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} · "
+        f"{len(session_log)} question(s)",
+        meta,
+    ))
+    story.append(Spacer(1, 0.15 * inch))
+
+    def _escape(s: str) -> str:
+        return (
+            (s or "")
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+        )
+
+    for i, entry in enumerate(session_log, start=1):
+        story.append(Paragraph(f"Q{i}. {_escape(entry.get('question', ''))}", h2))
+        ts = entry.get("timestamp")
+        if ts:
+            story.append(Paragraph(f"Asked at {ts}", meta))
+        sql = entry.get("sql") or ""
+        if sql:
+            story.append(Paragraph("<b>Generated SQL:</b>", body))
+            story.append(Preformatted(sql, mono))
+            story.append(Spacer(1, 0.08 * inch))
+        story.append(Paragraph("<b>Answer:</b>", body))
+        story.append(Paragraph(_escape(entry.get("answer", "")), body))
+        story.append(Spacer(1, 0.18 * inch))
+
+    doc.build(story)
+    return path
+
+
 def _build_response_elements(result: dict[str, Any]) -> list:
     """Assemble the table + (optional) chart + CSV download for a successful result."""
     elements: list = []
@@ -290,6 +386,11 @@ async def on_chat_start() -> None:
 
     cl.user_session.set("agent", agent)
     cl.user_session.set("chat_history", [])
+    # R3.8 — Untrimmed session log for the "Export to PDF" action. Unlike
+    # chat_history (last 5 turns only, used for LLM context), session_log
+    # captures every Q/A pair for the duration of the session so the user
+    # can take a PDF home at the end of the demo.
+    cl.user_session.set("session_log", [])
 
     # Intentionally no greeting bubble: sending any message here collapses
     # the Chainlit starter landing (big logo + starter buttons) into chat
@@ -397,7 +498,19 @@ async def _answer_question(question: str) -> None:
                     tooltip="Toggle a copyable block of the generated SQL",
                 )
             )
-        msg = cl.Message(content="", elements=elements, actions=sql_actions)
+        # R3.8 — Export-to-PDF action alongside Show/Hide SQL. Attached to
+        # every streamed assistant answer; clicking it builds a PDF from
+        # the full session log accumulated so far.
+        actions: list[cl.Action] = list(sql_actions)
+        actions.append(
+            cl.Action(
+                name="export_pdf",
+                payload={},
+                label="📄 Export session to PDF",
+                tooltip="Download a PDF of every Q/A in this session so far",
+            )
+        )
+        msg = cl.Message(content="", elements=elements, actions=actions)
         parts: list[str] = []
         try:
             async for chunk in agent.stream_summary(
@@ -441,9 +554,19 @@ async def _answer_question(question: str) -> None:
         await msg.send()
         answer_for_history = "".join(parts).strip() or "(no summary)"
 
-    # Step 4: update conversation history (last 5 turns).
+    # Step 4: update conversation history (last 5 turns) and the
+    # untrimmed session log used by the Export-to-PDF action.
     chat_history.append((question, answer_for_history))
     cl.user_session.set("chat_history", chat_history[-5:])
+
+    session_log: list[dict[str, Any]] = cl.user_session.get("session_log") or []
+    session_log.append({
+        "question": question,
+        "sql": prep.get("sql"),
+        "answer": answer_for_history,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    })
+    cl.user_session.set("session_log", session_log)
 
     # Step 5: LLM-generated follow-up suggestion buttons. Skipped for
     # canned answers (no data to drill into) and when disabled in config.
@@ -493,6 +616,38 @@ async def on_show_sql(action: cl.Action) -> None:
         await msg.send()
         toggles[action.id] = msg
     cl.user_session.set("sql_toggles", toggles)
+
+
+@cl.action_callback("export_pdf")
+async def on_export_pdf(action: cl.Action) -> None:
+    """Build a PDF of the whole session so far and attach it as a download."""
+    session_log: list[dict[str, Any]] = cl.user_session.get("session_log") or []
+    if not session_log:
+        await cl.Message(
+            content="Nothing to export yet — ask at least one question first.",
+        ).send()
+        return
+    pdf_path = _write_session_pdf(session_log)
+    if pdf_path is None:
+        await cl.ErrorMessage(
+            content=(
+                "PDF export unavailable — `reportlab` is not installed. "
+                "Run `pip install reportlab` (already listed in "
+                "requirements.txt) and try again."
+            )
+        ).send()
+        return
+    await cl.Message(
+        content=f"Session report ready — **{len(session_log)}** question(s) included.",
+        elements=[
+            cl.File(
+                name=f"openpayments-session-{datetime.now().strftime('%Y%m%d-%H%M%S')}.pdf",
+                path=str(pdf_path),
+                mime="application/pdf",
+                display="inline",
+            )
+        ],
+    ).send()
 
 
 @cl.action_callback("followup")
