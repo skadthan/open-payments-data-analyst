@@ -59,3 +59,24 @@ body, .cl-markdown {
   font-family: "Source Sans Pro", "Segoe UI", system-ui, -apple-system,
                sans-serif;
 }
+
+/*
+ * Persistent brand watermark — pinned to the bottom-left viewport so the
+ * logo stays visible after the chat collapses the starter landing screen.
+ * pointer-events: none keeps it from blocking clicks on anything beneath.
+ */
+body::before {
+  content: "";
+  position: fixed;
+  bottom: 16px;
+  left: 16px;
+  width: 180px;
+  height: 44px;
+  background-image: url("/public/openpayments-logo.png");
+  background-size: contain;
+  background-repeat: no-repeat;
+  background-position: left center;
+  z-index: 9999;
+  pointer-events: none;
+  opacity: 0.9;
+}

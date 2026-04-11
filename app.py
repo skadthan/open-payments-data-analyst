@@ -248,9 +248,11 @@ async def on_chat_start() -> None:
     cl.user_session.set("chat_history", [])
 
     # Intentionally no greeting bubble: sending any message here collapses
-    # the Chainlit starter landing (logo + starter buttons) into chat mode.
-    # The logo + starters ARE the landing. Stale-data warning is the one
-    # exception — it only fires when the DuckDB file is out of date.
+    # the Chainlit starter landing (big logo + starter buttons) into chat
+    # mode. The landing IS the greeting. The description text lives in
+    # chainlit.md (accessible via the Readme button). The bottom-left
+    # brand watermark in public/branding.css keeps the logo visible
+    # during the chat itself.
     stale_warning = _check_data_freshness()
     if stale_warning:
         await cl.Message(content=stale_warning).send()
@@ -319,8 +321,8 @@ async def _answer_question(question: str) -> None:
                 cl.Action(
                     name="show_sql",
                     payload={"sql": prep["sql"]},
-                    label="📋 Show SQL",
-                    tooltip="Open a copyable block of the generated SQL",
+                    label="📋 Show/Hide SQL",
+                    tooltip="Toggle a copyable block of the generated SQL",
                 )
             )
         msg = cl.Message(content="", elements=elements, actions=sql_actions)
@@ -386,14 +388,25 @@ async def _answer_question(question: str) -> None:
 
 @cl.action_callback("show_sql")
 async def on_show_sql(action: cl.Action) -> None:
-    """Render the generated SQL as a fresh, top-level copyable message."""
+    """Toggle the generated SQL: first click reveals a copyable SQL
+    message, second click removes it. Keyed per-action so each answer's
+    Show/Hide SQL button operates independently."""
     sql = (action.payload or {}).get("sql", "").strip()
     if not sql:
         return
-    await cl.Message(
-        content=f"```sql\n{sql}\n```",
-        author="SQL",
-    ).send()
+    toggles: dict = cl.user_session.get("sql_toggles") or {}
+    existing: cl.Message | None = toggles.get(action.id)
+    if existing is not None:
+        try:
+            await existing.remove()
+        except Exception:  # noqa: BLE001 — best-effort removal
+            pass
+        toggles.pop(action.id, None)
+    else:
+        msg = cl.Message(content=f"```sql\n{sql}\n```", author="SQL")
+        await msg.send()
+        toggles[action.id] = msg
+    cl.user_session.set("sql_toggles", toggles)
 
 
 @cl.action_callback("followup")

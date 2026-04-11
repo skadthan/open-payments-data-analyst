@@ -1,3 +1,5 @@
+![CMS Open Payments](/public/openpayments-logo.png)
+
 # CMS Open Payments Data Analyst
 
 A natural-language interface to the **CMS Open Payments** program — the
