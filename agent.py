@@ -171,6 +171,30 @@ Write a concise 2-4 sentence answer in plain English. Reference specific numbers
 from the data when relevant. Do not make up values. Do not restate the SQL.
 """
 
+FOLLOWUP_PROMPT_TEMPLATE = """\
+You just answered a question about CMS Open Payments data.
+
+Original question: {question}
+
+Answer you gave: {answer}
+
+Suggest exactly 3 short follow-up questions a CMS Open Payments analyst
+would naturally ask next, given that answer. Rules:
+- One question per line.
+- No numbering, no bullets, no quotes, no prose before or after.
+- Each question max 70 characters.
+- Questions must be about the same CMS Open Payments dataset (2021-2024).
+- Prefer drill-downs (by year, state, specialty, product) over brand-new topics.
+"""
+
+EMPTY_RESULT_MESSAGE = (
+    "No matching records were found for that query. A few things to try:\n"
+    "- Double-check the spelling of any names, companies, or drugs.\n"
+    "- Try a partial match (e.g. just the last name) — I search case-insensitively.\n"
+    "- Broaden the year range or remove other filters.\n"
+    "- Confirm the entity is in the CMS Open Payments dataset (2021-2024)."
+)
+
 UNSUPPORTED_MESSAGE = (
     "I can only answer questions about the CMS Open Payments dataset "
     "(pharmaceutical and medical device payments to physicians, 2021-2024). "
@@ -316,36 +340,81 @@ class SQLAgent:
         response = self.llm_sql.invoke(messages)
         return extract_sql(response.content)
 
-    def _summarize(self, question: str, sql: str, df: pd.DataFrame) -> str:
-        if df.empty:
-            return (
-                "No matching records were found for that query. A few things to try:\n"
-                "- Double-check the spelling of any names, companies, or drugs.\n"
-                "- Try a partial match (e.g. just the last name) — I search case-insensitively.\n"
-                "- Broaden the year range or remove other filters.\n"
-                "- Confirm the entity is in the CMS Open Payments dataset (2021-2024)."
-            )
-
+    def _summary_prompt(self, question: str, sql: str, df: pd.DataFrame) -> str:
         preview = df.head(20).to_csv(index=False)
-        prompt = SUMMARIZE_PROMPT_TEMPLATE.format(
+        return SUMMARIZE_PROMPT_TEMPLATE.format(
             question=question,
             sql=sql,
             csv_preview=preview,
             total_rows=len(df),
         )
+
+    def _summarize(self, question: str, sql: str, df: pd.DataFrame) -> str:
+        """Blocking summary (used by run_query back-compat wrapper)."""
+        if df.empty:
+            return EMPTY_RESULT_MESSAGE
+        prompt = self._summary_prompt(question, sql, df)
         response = self.llm_summary.invoke([HumanMessage(content=prompt)])
         return response.content.strip()
 
-    # --- Main entry point ------------------------------------------------
+    async def stream_summary(
+        self,
+        question: str,
+        sql: str,
+        df: pd.DataFrame,
+    ):
+        """Async generator yielding summary text chunks.
 
-    def run_query(
+        For empty/canned cases the caller should use `prep["canned_answer"]`
+        directly instead of streaming — this method is only for the
+        success path with a non-empty DataFrame.
+        """
+        prompt = self._summary_prompt(question, sql, df)
+        async for chunk in self.llm_summary.astream([HumanMessage(content=prompt)]):
+            text = getattr(chunk, "content", "") or ""
+            if text:
+                yield text
+
+    def suggest_followups(
+        self,
+        question: str,
+        answer: str,
+        max_suggestions: int = 3,
+    ) -> list[str]:
+        """Generate up to `max_suggestions` follow-up questions.
+
+        Failures are swallowed — the caller gets an empty list rather than
+        an exception, because follow-ups must never break the main answer.
+        """
+        try:
+            prompt = FOLLOWUP_PROMPT_TEMPLATE.format(
+                question=question,
+                answer=answer,
+            )
+            response = self.llm_summary.invoke([HumanMessage(content=prompt)])
+            raw = (response.content or "").strip()
+            lines = [line.strip(" -•\"'\t") for line in raw.splitlines()]
+            lines = [line for line in lines if line and len(line) <= 120]
+            return lines[:max_suggestions]
+        except Exception:
+            return []
+
+    # --- Main entry points -----------------------------------------------
+
+    def prepare(
         self,
         question: str,
         chat_history: list[tuple[str, str]] | None = None,
     ) -> dict[str, Any]:
-        """Translate `question` to SQL, execute, and summarize.
+        """Generate + execute SQL, but do NOT run the summary LLM call.
 
-        Returns a dict with the fixed shape documented in phase-2-plan.md.
+        Returns a dict with:
+          - question, sql, data, error, attempts, elapsed_sec
+          - canned_answer: str | None — set for unsupported / empty-df
+            cases where the caller should skip streaming and use this
+            fixed text instead
+        On success with non-empty data, canned_answer is None and the
+        caller should stream the summary via `stream_summary(...)`.
         """
         if chat_history is None:
             chat_history = []
@@ -354,13 +423,12 @@ class SQLAgent:
         error_context: str | None = None
         last_sql: str | None = None
         last_err: str | None = None
-        total_attempts = self.max_retries + 1  # 1 fresh + N retries
+        total_attempts = self.max_retries + 1
 
         for attempt in range(1, total_attempts + 1):
             try:
                 sql = self._generate_sql(question, error_context, chat_history)
             except Exception as e:
-                # LLM call failed outright (e.g. Ollama not running).
                 return self._error_result(
                     question, None, f"LLM call failed: {e}", attempt, start
                 )
@@ -372,19 +440,17 @@ class SQLAgent:
                 last_err = "empty LLM response"
                 continue
 
-            # Unsupported-question sentinel.
             if sql.strip().lower().startswith("select 'unsupported'"):
                 return {
                     "question": question,
                     "sql": sql,
                     "data": pd.DataFrame(),
-                    "answer": UNSUPPORTED_MESSAGE,
+                    "canned_answer": UNSUPPORTED_MESSAGE,
                     "error": None,
                     "attempts": attempt,
                     "elapsed_sec": time.perf_counter() - start,
                 }
 
-            # Execute the SQL.
             try:
                 df = self.con.execute(sql).fetchdf()
             except Exception as e:
@@ -396,29 +462,49 @@ class SQLAgent:
                 )
                 continue
 
-            # Success — summarize and return.
-            try:
-                answer = self._summarize(question, sql, df)
-            except Exception as e:
-                answer = (
-                    f"(Summary unavailable — summarization LLM call failed: {e}) "
-                    f"The query returned {len(df)} row(s)."
-                )
-
+            canned = EMPTY_RESULT_MESSAGE if df.empty else None
             return {
                 "question": question,
                 "sql": sql,
                 "data": df,
-                "answer": answer,
+                "canned_answer": canned,
                 "error": None,
                 "attempts": attempt,
                 "elapsed_sec": time.perf_counter() - start,
             }
 
-        # Exhausted retries.
         return self._error_result(
             question, last_sql, last_err or "unknown error", total_attempts, start
         )
+
+    def run_query(
+        self,
+        question: str,
+        chat_history: list[tuple[str, str]] | None = None,
+    ) -> dict[str, Any]:
+        """Blocking end-to-end: prepare + summarize. Back-compat wrapper.
+
+        Used by the CLI REPL and `smoke-test-agent.py`. The Chainlit app
+        uses `prepare` + `stream_summary` directly so the summary can
+        stream token-by-token.
+        """
+        prep = self.prepare(question, chat_history)
+        if prep.get("error"):
+            prep["answer"] = None
+            return prep
+        if prep.get("canned_answer") is not None:
+            prep["answer"] = prep.pop("canned_answer")
+            return prep
+        try:
+            answer = self._summarize(question, prep["sql"], prep["data"])
+        except Exception as e:
+            answer = (
+                f"(Summary unavailable — summarization LLM call failed: {e}) "
+                f"The query returned {len(prep['data'])} row(s)."
+            )
+        prep["answer"] = answer
+        prep.pop("canned_answer", None)
+        return prep
 
     @staticmethod
     def _error_result(

@@ -145,3 +145,100 @@ Run `python run.py`, then:
 Each of 5.1 – 5.5 lands as its own commit with a smoke test. If any one
 of them reveals a deeper issue, that item is deferred and the demo
 proceeds without it rather than holding up the rest.
+
+---
+
+## Round 2 — Additional demo polish (A / B / C / D)
+
+After Phase 5.1–5.5 landed and were pushed, four additional improvements
+were added to reshape the demo feel from "ask-wait-dump" to
+"conversational analyst with CMS-native styling":
+
+### A — Streaming the summary response
+
+**Problem.** `agent.py::_summarize` was blocking — the UI sat silent
+for 2–5 s per answer, then dumped the whole paragraph at once.
+
+**Change.** Split `SQLAgent.run_query` into:
+- `prepare(question, chat_history)` — runs the SQL generation + execution
+  + retry loop and returns `{sql, data, error, attempts, canned_answer}`.
+- `stream_summary(question, sql, df)` — async generator yielding text
+  chunks via `llm_summary.astream(...)`.
+
+`run_query` is kept as a back-compat wrapper so `smoke-test-agent.py`
+and the CLI REPL still work.
+
+`app.py::on_message` now calls `prepare` first, then either renders a
+canned answer (unsupported / empty-df) or streams tokens into
+`cl.Message.stream_token(...)`. The truncation notice is appended after
+streaming finishes.
+
+### B — LLM-generated follow-up suggestions
+
+**Problem.** The conversation stalled after each answer. A live demo
+needs to flow through 3–4 questions without the user typing.
+
+**Change.** Added `SQLAgent.suggest_followups(question, answer)` which
+makes a third LLM call with a structured prompt ("propose 3 follow-up
+questions, one per line, max 70 chars"). Results render as
+`cl.Action` buttons on a fresh `cl.Message("You might also ask:")`.
+A `@cl.action_callback("followup")` handler echoes the clicked
+question as a user message and re-enters the same pipeline via a
+shared `_answer_question` helper.
+
+Gated on `config.yaml` → `ui.show_followups: true` so the feature can
+be toggled off in under a second if the extra LLM call slows rehearsal.
+Wrapped in a broad `try/except` — follow-up generation failures never
+touch the main answer.
+
+### C — Show-SQL action
+
+**Problem.** Selecting text inside a collapsed "Generating SQL" step
+to copy the SQL is fiddly for technical clients.
+
+**Change.** Attaches `cl.Action(name="show_sql", payload={"sql": ...})`
+to the summary message. The callback sends a fresh, top-level
+assistant message containing only the SQL in a fenced code block,
+which is easy to select and copy. Gated on `config.yaml` →
+`ui.show_copy_sql: true`.
+
+### D — CMS Open Payments branding
+
+**Problem.** The demo showed the generic Chainlit default name, logo,
+and theme. A CMS/healthcare client would clock the mismatch immediately.
+
+**Change.**
+- `.chainlit/config.toml` `[UI]`: `name = "CMS Open Payments Data Analyst"`,
+  `description = "..."`, `logo_file_url = "/public/openpayments-logo.png"`,
+  `default_avatar_file_url = "/public/openpayments-avatar.png"`,
+  `custom_css = "/public/branding.css"`.
+- New `.chainlit/public/branding.css` overriding primary color to USWDS
+  gov blue `#005ea2` with accent `#0050d8`, tightening the font stack
+  toward Source Sans Pro, and restyling the header/starter buttons.
+- New `.chainlit/public/openpayments-logo.png` and
+  `openpayments-avatar.png` — placeholder text wordmarks generated
+  locally with PIL in the CMS blue palette. The user can overwrite
+  these files with the real CMS assets at any time — no code change
+  needed.
+- `chainlit.md` and `app.py::GREETING` rewritten to match CMS-aligned
+  copy ("CMS Open Payments program", "financial relationships between
+  pharmaceutical and medical device manufacturers and U.S. physicians
+  and teaching hospitals").
+
+**Asset-sourcing note.** The authoritative source was
+`https://openpayments.system.cms.gov/login`, but outbound WebFetch
+failed (SSL + timeout) from this environment. Path 2 (locally-generated
+placeholder + USWDS colors) was taken for the initial commit so the
+feature is self-contained.
+
+### Round 2 acceptance criteria
+
+- [ ] A — summary text appears character-by-character, not all-at-once
+- [ ] B — three follow-up buttons render after each answer; clicking
+      one re-enters the pipeline and produces a new streamed answer
+- [ ] C — "📋 Show SQL" action renders a copyable SQL message on click
+- [ ] D — tab shows "CMS Open Payments Data Analyst", header logo is
+      the new image, primary color is gov blue
+- [ ] No regressions on Phase 5.1–5.5 (CSV download, truncation notice,
+      starters, stale-data warning, friendly errors) or on the Phase 4
+      15-query suite

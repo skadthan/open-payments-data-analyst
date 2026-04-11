@@ -1,9 +1,11 @@
-# Open Payments Data Analyst
+# CMS Open Payments Data Analyst
 
-A natural-language interface to the **CMS Open Payments** dataset —
-pharmaceutical and medical device industry payments to U.S. physicians and
-teaching hospitals from **2021 through 2024** (about 55 million records
-across general payments, research payments, and ownership interests).
+A natural-language interface to the **CMS Open Payments** program — the
+national disclosure dataset of financial relationships between
+pharmaceutical and medical device manufacturers and U.S. physicians and
+teaching hospitals, covering **calendar years 2021 through 2024**
+(about 55 million records across general payments, research payments,
+and ownership interests).
 
 Ask questions in plain English. The agent translates them to DuckDB SQL,
 runs them locally, and explains the results. Everything runs on your

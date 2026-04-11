@@ -33,6 +33,12 @@ raw/
 *.log
 !ingest.log
 
-# Auto-generated tool scaffolding
-.chainlit/
+# Auto-generated tool scaffolding — but keep the config and brand assets
+.chainlit/*
+!.chainlit/config.toml
+!.chainlit/public
+.chainlit/public/*
+!.chainlit/public/branding.css
+!.chainlit/public/openpayments-logo.png
+!.chainlit/public/openpayments-avatar.png
 .claude/

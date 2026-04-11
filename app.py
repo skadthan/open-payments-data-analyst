@@ -43,10 +43,12 @@ CONFIG: dict = _load_config(CONFIG_PATH)
 
 
 GREETING = (
-    "Welcome to the **Open Payments Data Analyst**.\n\n"
-    "I can answer questions about CMS Open Payments — pharmaceutical and "
-    "medical device industry payments to U.S. physicians and teaching "
-    "hospitals from **2021 through 2024** (about 55 million records).\n\n"
+    "Welcome to the **CMS Open Payments Data Analyst**.\n\n"
+    "I can answer natural-language questions about the CMS Open Payments "
+    "program — financial relationships between pharmaceutical and medical "
+    "device manufacturers and U.S. physicians and teaching hospitals from "
+    "**2021 through 2024** (about 55 million records across general "
+    "payments, research payments, and ownership interests).\n\n"
     "Pick one of the starter prompts below, or type your own question."
 )
 
@@ -251,9 +253,9 @@ async def on_chat_start() -> None:
         await cl.Message(content=stale_warning).send()
 
 
-@cl.on_message
-async def on_message(message: cl.Message) -> None:
-    """Handle one user turn end-to-end."""
+async def _answer_question(question: str) -> None:
+    """Run a single user question end-to-end (used by on_message and
+    the follow-up action callback in Phase 5.B)."""
     agent: SQLAgent | None = cl.user_session.get("agent")
     if agent is None:
         await cl.ErrorMessage(
@@ -265,26 +267,22 @@ async def on_message(message: cl.Message) -> None:
 
     # Step 1: SQL generation + execution (visible as a collapsible step).
     async with cl.Step(name="Generating SQL", type="tool") as step:
-        result = await cl.make_async(agent.run_query)(
-            message.content, chat_history
-        )
-        if result.get("sql"):
-            step.output = f"```sql\n{result['sql']}\n```"
-        if result.get("error"):
+        prep = await cl.make_async(agent.prepare)(question, chat_history)
+        if prep.get("sql"):
+            step.output = f"```sql\n{prep['sql']}\n```"
+        if prep.get("error"):
             prev = step.output or ""
             step.output = (
-                f"{prev}\n\n**Error after {result['attempts']} attempt(s):** "
-                f"{result['error']}"
+                f"{prev}\n\n**Error after {prep['attempts']} attempt(s):** "
+                f"{prep['error']}"
             )
 
-    # Step 2: error path — show a plain-English error and stop. The
-    # technical detail is already visible inside the "Generating SQL"
-    # step above, so we do not repeat the raw DuckDB traceback here.
-    if result.get("error"):
+    # Step 2: error path — plain-English message, raw detail stays in the step.
+    if prep.get("error"):
         await cl.ErrorMessage(
             content=(
                 "I couldn't answer that after "
-                f"{result['attempts']} attempt(s). This usually means the "
+                f"{prep['attempts']} attempt(s). This usually means the "
                 "question is ambiguous or references data that isn't in "
                 "the CMS Open Payments dataset (2021–2024).\n\n"
                 "**Things to try:**\n"
@@ -297,27 +295,125 @@ async def on_message(message: cl.Message) -> None:
         ).send()
         return
 
-    # Step 3: success path — answer + table + (optional) chart + CSV.
-    elements = _build_response_elements(result)
-    answer = result.get("answer") or "(no summary available)"
+    # Step 3: success path — build elements once, then either render
+    # the canned text (unsupported / empty df) or stream the summary.
+    elements = _build_response_elements(prep)
+    canned = prep.get("canned_answer")
 
-    # Row-truncation notice: cross-sells the CSV download when the
-    # inline table is showing only a slice of the full result.
-    df = result.get("data")
-    if df is not None and not df.empty:
+    if canned is not None:
+        # Unsupported question or empty-result case: fixed text, no streaming,
+        # no elements beyond whatever _build_response_elements returned
+        # (which will be [] for empty df anyway).
+        await cl.Message(content=canned, elements=elements).send()
+        answer_for_history = canned
+    else:
+        # Streamed summary: create an empty message, stream tokens,
+        # append the truncation notice if needed, then send() to finalize.
+        df = prep["data"]
+        sql_actions: list[cl.Action] = []
+        if CONFIG["ui"].get("show_copy_sql", True) and prep.get("sql"):
+            sql_actions.append(
+                cl.Action(
+                    name="show_sql",
+                    payload={"sql": prep["sql"]},
+                    label="📋 Show SQL",
+                    tooltip="Open a copyable block of the generated SQL",
+                )
+            )
+        msg = cl.Message(content="", elements=elements, actions=sql_actions)
+        parts: list[str] = []
+        try:
+            async for chunk in agent.stream_summary(
+                prep["question"], prep["sql"], df
+            ):
+                parts.append(chunk)
+                await msg.stream_token(chunk)
+        except Exception as e:  # noqa: BLE001 — streaming must degrade gracefully
+            fallback = (
+                f"(Summary unavailable — summarization LLM call failed: {e}) "
+                f"The query returned {len(df):,} row(s)."
+            )
+            parts = [fallback]
+            msg.content = fallback
+
+        # Row-truncation notice appended after the streamed summary.
         max_rows = int(CONFIG["ui"]["max_display_rows"])
         if len(df) > max_rows:
-            answer += (
+            notice = (
                 f"\n\n> ℹ️ Showing the first **{max_rows:,}** of "
                 f"**{len(df):,}** rows. Use the CSV download below for "
                 "the full result."
             )
+            msg.content += notice
+            parts.append(notice)
 
-    await cl.Message(content=answer, elements=elements).send()
+        await msg.send()
+        answer_for_history = "".join(parts).strip() or "(no summary)"
 
     # Step 4: update conversation history (last 5 turns).
-    chat_history.append((message.content, result.get("answer") or ""))
+    chat_history.append((question, answer_for_history))
     cl.user_session.set("chat_history", chat_history[-5:])
+
+    # Step 5: LLM-generated follow-up suggestion buttons. Skipped for
+    # canned answers (no data to drill into) and when disabled in config.
+    # Wrapped in a broad try/except — follow-ups must never break the
+    # main answer.
+    if canned is None and CONFIG["ui"].get("show_followups", True):
+        try:
+            suggestions = await cl.make_async(agent.suggest_followups)(
+                question, answer_for_history
+            )
+        except Exception:  # noqa: BLE001
+            suggestions = []
+        if suggestions:
+            actions = [
+                cl.Action(
+                    name="followup",
+                    payload={"question": s},
+                    label=s,
+                    tooltip="Click to ask this follow-up question",
+                )
+                for s in suggestions
+            ]
+            await cl.Message(
+                content="**You might also ask:**",
+                actions=actions,
+            ).send()
+
+
+@cl.action_callback("show_sql")
+async def on_show_sql(action: cl.Action) -> None:
+    """Render the generated SQL as a fresh, top-level copyable message."""
+    sql = (action.payload or {}).get("sql", "").strip()
+    if not sql:
+        return
+    await cl.Message(
+        content=f"```sql\n{sql}\n```",
+        author="SQL",
+    ).send()
+
+
+@cl.action_callback("followup")
+async def on_followup_action(action: cl.Action) -> None:
+    """Handle a click on one of the LLM-generated follow-up buttons."""
+    try:
+        await action.remove()  # prevent double-click / re-fire
+    except Exception:  # noqa: BLE001
+        pass
+    question = (action.payload or {}).get("question", "").strip()
+    if not question:
+        return
+    # Echo the user's choice as a chat message so the transcript reads
+    # naturally, then delegate to the same pipeline on_message uses.
+    await cl.Message(content=question, author="User", type="user_message").send()
+    await _answer_question(question)
+
+
+@cl.on_message
+async def on_message(message: cl.Message) -> None:
+    """Thin wrapper — delegates to `_answer_question` so the
+    follow-up action callback in Phase 5.B can reuse the same pipeline."""
+    await _answer_question(message.content)
 
 
 @cl.on_chat_end

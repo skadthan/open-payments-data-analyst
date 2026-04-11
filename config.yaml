@@ -28,3 +28,5 @@ ui:
   show_charts: true                   # auto-generate charts for numeric results
   theme: dark                         # Chainlit theme: dark or light
   show_agent_steps: true              # show SQL generation/execution as expandable steps
+  show_followups: true                # LLM-generated follow-up question buttons after each answer
+  show_copy_sql: true                 # "Show SQL" action button for a copyable SQL block
