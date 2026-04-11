@@ -61,24 +61,31 @@ body, .cl-markdown {
 }
 
 /*
- * Persistent brand watermark — pinned to the bottom-left viewport so the
- * logo stays visible after the chat collapses the starter landing screen.
- * pointer-events: none keeps it from blocking clicks on anything beneath.
+ * Persistent brand logo pinned directly above the title banner.
+ * This is the SAME logo Chainlit shows on the landing screen, but
+ * pinned via CSS so it stays visible once the chat starts and
+ * Chainlit collapses the starter landing.
+ *
+ * Co-located with body::after (title) — same horizontal anchor
+ * (left: 15%, translateX(-50%)) so the logo and title stack
+ * cleanly as one visual unit. The previous bottom-left watermark
+ * was removed once this top-anchored version landed — having
+ * both was redundant.
  */
 body::before {
   content: "";
   position: fixed;
-  bottom: 16px;
-  left: 16px;
+  top: 8px;
+  left: 7%;
+  transform: translateX(-50%);
   width: 180px;
   height: 44px;
   background-image: url("/public/openpayments-logo.png");
   background-size: contain;
   background-repeat: no-repeat;
-  background-position: left center;
-  z-index: 9999;
+  background-position: center;
+  z-index: 9998;
   pointer-events: none;
-  opacity: 0.9;
 }
 
 /*
@@ -92,8 +99,8 @@ body::before {
 body::after {
   content: "CMS Open Payments AI Data Analyst";
   position: fixed;
-  top: 356px;
-  left: 50%;
+  top: 56px;
+  left: 15%;
   transform: translateX(-50%);
   font-family: "Source Sans Pro", "Segoe UI", system-ui, -apple-system,
                sans-serif;
