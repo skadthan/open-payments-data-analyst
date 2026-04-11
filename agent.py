@@ -1,0 +1,497 @@
+"""
+Open Payments LLM Agent — Text-to-SQL core.
+
+Translates natural-language questions into DuckDB SQL, executes them
+against the Phase 1 data layer, retries on SQL errors, and summarizes
+the results with a second LLM call. All LLM calls go to a local Ollama
+server (zero cost).
+
+Public API:
+    from agent import SQLAgent
+    agent = SQLAgent("config.yaml")
+    result = agent.run_query("Top 10 companies by total payments in 2024", chat_history=[])
+    # result = {
+    #     "question":    str,
+    #     "sql":         str | None,
+    #     "data":        pandas.DataFrame | None,
+    #     "answer":      str | None,
+    #     "error":       str | None,
+    #     "attempts":    int,
+    #     "elapsed_sec": float,
+    # }
+
+CLI smoke test:
+    python agent.py
+
+See phase-2-plan.md for the full design rationale.
+"""
+from __future__ import annotations
+
+import re
+import sys
+import time
+import warnings
+from pathlib import Path
+from typing import Any
+
+import duckdb
+import pandas as pd
+import yaml
+
+# Silence the Python 3.14 pydantic v1 deprecation warning emitted at
+# `from langchain_ollama import ChatOllama`. It's cosmetic; does not
+# affect runtime behavior.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*Pydantic V1.*",
+    category=UserWarning,
+)
+
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_ollama import ChatOllama
+
+
+# --- Key columns (hand-curated for prompt injection) -----------------------
+
+# We can't inline all 252 research columns into the prompt. These are the
+# analytically useful ones per table — types are looked up from
+# _schema_metadata at SchemaManager init time.
+KEY_COLUMNS: dict[str, list[str]] = {
+    "general_payments": [
+        "Program_Year",
+        "Date_of_Payment",
+        "Total_Amount_of_Payment_USDollars",
+        "Number_of_Payments_Included_in_Total_Amount",
+        "Nature_of_Payment_or_Transfer_of_Value",
+        "Form_of_Payment_or_Transfer_of_Value",
+        "Applicable_Manufacturer_or_Applicable_GPO_Making_Payment_Name",
+        "Applicable_Manufacturer_or_Applicable_GPO_Making_Payment_State",
+        "Covered_Recipient_Type",
+        "Covered_Recipient_First_Name",
+        "Covered_Recipient_Last_Name",
+        "Covered_Recipient_NPI",
+        "Covered_Recipient_Specialty_1",
+        "Recipient_City",
+        "Recipient_State",
+        "Recipient_Country",
+        "Name_of_Drug_or_Biological_or_Device_or_Medical_Supply_1",
+        "Product_Category_or_Therapeutic_Area_1",
+        "Physician_Ownership_Indicator",
+        "Teaching_Hospital_Name",
+        "Teaching_Hospital_CCN",
+    ],
+    "research_payments": [
+        "Program_Year",
+        "Total_Amount_of_Payment_USDollars",
+        "Name_of_Study",
+        "Context_of_Research",
+        "Preclinical_Research_Indicator",
+        "ClinicalTrials_Gov_Identifier",
+        "Applicable_Manufacturer_or_Applicable_GPO_Making_Payment_Name",
+        "Applicable_Manufacturer_or_Applicable_GPO_Making_Payment_State",
+        "Principal_Investigator_1_First_Name",
+        "Principal_Investigator_1_Last_Name",
+        "Principal_Investigator_1_NPI",
+        "Principal_Investigator_1_Specialty_1",
+        "Principal_Investigator_1_State",
+        "Product_Category_or_Therapeutic_Area_1",
+        "Expenditure_Category1",
+        "Recipient_City",
+        "Recipient_State",
+    ],
+    "ownership_payments": [
+        "Program_Year",
+        "Physician_First_Name",
+        "Physician_Last_Name",
+        "Physician_NPI",
+        "Physician_Specialty",
+        "Recipient_State",
+        "Recipient_City",
+        "Total_Amount_Invested_USDollars",
+        "Value_of_Interest",
+        "Terms_of_Interest",
+        "Interest_Held_by_Physician_or_an_Immediate_Family_Member",
+        "Applicable_Manufacturer_or_Applicable_GPO_Making_Payment_Name",
+    ],
+    "removed_deleted": [
+        "Change_Type",
+        "Program_Year",
+        "Payment_Type",
+        "Record_ID",
+    ],
+}
+
+
+# --- Prompt templates ------------------------------------------------------
+
+SYSTEM_PROMPT_TEMPLATE = """\
+You are a DuckDB SQL analyst for the CMS Open Payments dataset (calendar years 2021-2024).
+Your job is to translate the user's question into ONE DuckDB SQL query.
+
+Schema (key columns only; more columns exist but rarely matter):
+{compact_schema}
+
+Per-year tables (replace YYYY with 2021, 2022, 2023, or 2024):
+  general_payments_YYYY
+  research_payments_YYYY
+  ownership_payments_YYYY
+  removed_deleted_YYYY
+
+UNION ALL views spanning every year:
+  all_general_payments, all_research_payments, all_ownership_payments, all_removed_deleted
+
+Rules:
+1. Output ONLY the SQL query. No prose, no explanation, no markdown code fences.
+2. Use DuckDB syntax (not PostgreSQL or MySQL). Use DATE_TRUNC('month', Date_of_Payment) for monthly aggregation.
+3. Column names are Snake_Case and case-sensitive. Copy them EXACTLY as shown in the schema.
+4. For single-year questions, query the per-year table (e.g. general_payments_2024).
+   For cross-year questions, query the matching all_* view.
+5. Always add `LIMIT 100` unless the user explicitly asks for all rows or a specific larger limit.
+6. Monetary amounts: Total_Amount_of_Payment_USDollars (general/research), Total_Amount_Invested_USDollars (ownership).
+7. The paying company is Applicable_Manufacturer_or_Applicable_GPO_Making_Payment_Name.
+8. If the question is not related to Open Payments data, respond with exactly: SELECT 'unsupported' AS note;
+"""
+
+SUMMARIZE_PROMPT_TEMPLATE = """\
+You are answering a user's question about CMS Open Payments data.
+
+Question: {question}
+
+The analyst ran this SQL:
+{sql}
+
+And got these results (first 20 rows as CSV):
+{csv_preview}
+
+Total rows in the full result: {total_rows}
+
+Write a concise 2-4 sentence answer in plain English. Reference specific numbers
+from the data when relevant. Do not make up values. Do not restate the SQL.
+"""
+
+UNSUPPORTED_MESSAGE = (
+    "I can only answer questions about the CMS Open Payments dataset "
+    "(pharmaceutical and medical device payments to physicians, 2021-2024). "
+    "Please rephrase your question to focus on that data."
+)
+
+
+# --- SQL extraction --------------------------------------------------------
+
+_SQL_FENCE_RE = re.compile(r"```(?:sql)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
+
+
+def extract_sql(text: str) -> str:
+    """Strip markdown code fences if present and return the SQL body."""
+    if not text:
+        return ""
+    m = _SQL_FENCE_RE.search(text)
+    if m:
+        return m.group(1).strip()
+    return text.strip()
+
+
+# --- SchemaManager ---------------------------------------------------------
+
+class SchemaManager:
+    """Builds the compact schema string used in the system prompt.
+
+    Types are read from the **actual** DuckDB views via information_schema
+    (not from _schema_metadata) because the data dictionaries and the
+    Parquet-inferred types occasionally disagree — e.g. `Program_Year` is
+    BIGINT in Parquet but was declared 'integer' → BIGINT in the dictionary,
+    yet `Physician_Ownership_Indicator` ended up BOOLEAN in Parquet but
+    'string' → VARCHAR in the dictionary. The LLM's SQL runs against the
+    views, so the view types are the ones that matter.
+    """
+
+    # One representative per-year view per table_type is enough —
+    # schemas are identical across years.
+    _REP_VIEW = {
+        "general_payments": "general_payments_2024",
+        "research_payments": "research_payments_2024",
+        "ownership_payments": "ownership_payments_2024",
+        "removed_deleted": "removed_deleted_2024",
+    }
+
+    def __init__(self, con: duckdb.DuckDBPyConnection) -> None:
+        self._types: dict[tuple[str, str], str] = {}
+        for table_type, view_name in self._REP_VIEW.items():
+            rows = con.execute(
+                "SELECT column_name, data_type FROM information_schema.columns "
+                "WHERE table_schema = 'main' AND table_name = ?",
+                [view_name],
+            ).fetchall()
+            for column_name, data_type in rows:
+                self._types[(table_type, column_name)] = data_type or "?"
+
+    def compact_schema(self) -> str:
+        lines: list[str] = []
+        for table_type, cols in KEY_COLUMNS.items():
+            lines.append(f"  {table_type}:")
+            for col in cols:
+                dtype = self._types.get((table_type, col), "?")
+                lines.append(f"    - {col} [{dtype}]")
+        return "\n".join(lines)
+
+
+# --- SQLAgent --------------------------------------------------------------
+
+class SQLAgent:
+    """Main agent. One instance per chat session."""
+
+    def __init__(self, config_path: str = "config.yaml") -> None:
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+
+        self.cfg = cfg
+        self.max_retries: int = int(cfg["model"]["max_retries"])
+        self.timeout: int = int(cfg["model"]["timeout"])
+
+        duckdb_path = Path(cfg["data"]["duckdb_path"]).resolve()
+        if not duckdb_path.exists():
+            raise FileNotFoundError(
+                f"DuckDB file not found at {duckdb_path}. "
+                "Run `python ingest.py --rebuild` first."
+            )
+        try:
+            self.con = duckdb.connect(str(duckdb_path), read_only=True)
+        except duckdb.IOException as e:
+            raise IOError(
+                f"Could not open {duckdb_path} in read-only mode: {e}. "
+                "Another process (e.g. `duckdb.exe` CLI) may be holding "
+                "an exclusive lock. Close it and try again."
+            ) from e
+
+        self.schema = SchemaManager(self.con)
+        self.system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
+            compact_schema=self.schema.compact_schema()
+        )
+
+        self.llm_sql = ChatOllama(
+            model=cfg["model"]["name"],
+            base_url=cfg["model"]["base_url"],
+            temperature=float(cfg["model"]["temperature"]),
+        )
+        self.llm_summary = ChatOllama(
+            model=cfg["model"]["name"],
+            base_url=cfg["model"]["base_url"],
+            temperature=float(cfg["model"]["summarization_temperature"]),
+        )
+
+    # --- LLM call construction -------------------------------------------
+
+    def _build_messages(
+        self,
+        question: str,
+        error_context: str | None,
+        chat_history: list[tuple[str, str]],
+    ) -> list:
+        msgs: list = [SystemMessage(content=self.system_prompt)]
+
+        # Last 4 exchanges for conversational context.
+        for prev_q, prev_a in chat_history[-4:]:
+            msgs.append(HumanMessage(content=prev_q))
+            msgs.append(AIMessage(content=prev_a))
+
+        if error_context:
+            user_content = (
+                f"{question}\n\n"
+                f"(Retry context — your previous attempt failed:\n{error_context})"
+            )
+        else:
+            user_content = question
+        msgs.append(HumanMessage(content=user_content))
+        return msgs
+
+    def _generate_sql(
+        self,
+        question: str,
+        error_context: str | None,
+        chat_history: list[tuple[str, str]],
+    ) -> str:
+        messages = self._build_messages(question, error_context, chat_history)
+        response = self.llm_sql.invoke(messages)
+        return extract_sql(response.content)
+
+    def _summarize(self, question: str, sql: str, df: pd.DataFrame) -> str:
+        if df.empty:
+            return "The query returned no rows."
+
+        preview = df.head(20).to_csv(index=False)
+        prompt = SUMMARIZE_PROMPT_TEMPLATE.format(
+            question=question,
+            sql=sql,
+            csv_preview=preview,
+            total_rows=len(df),
+        )
+        response = self.llm_summary.invoke([HumanMessage(content=prompt)])
+        return response.content.strip()
+
+    # --- Main entry point ------------------------------------------------
+
+    def run_query(
+        self,
+        question: str,
+        chat_history: list[tuple[str, str]] | None = None,
+    ) -> dict[str, Any]:
+        """Translate `question` to SQL, execute, and summarize.
+
+        Returns a dict with the fixed shape documented in phase-2-plan.md.
+        """
+        if chat_history is None:
+            chat_history = []
+
+        start = time.perf_counter()
+        error_context: str | None = None
+        last_sql: str | None = None
+        last_err: str | None = None
+        total_attempts = self.max_retries + 1  # 1 fresh + N retries
+
+        for attempt in range(1, total_attempts + 1):
+            try:
+                sql = self._generate_sql(question, error_context, chat_history)
+            except Exception as e:
+                # LLM call failed outright (e.g. Ollama not running).
+                return self._error_result(
+                    question, None, f"LLM call failed: {e}", attempt, start
+                )
+
+            last_sql = sql
+
+            if not sql:
+                error_context = "You returned an empty response. Return valid DuckDB SQL."
+                last_err = "empty LLM response"
+                continue
+
+            # Unsupported-question sentinel.
+            if sql.strip().lower().startswith("select 'unsupported'"):
+                return {
+                    "question": question,
+                    "sql": sql,
+                    "data": pd.DataFrame(),
+                    "answer": UNSUPPORTED_MESSAGE,
+                    "error": None,
+                    "attempts": attempt,
+                    "elapsed_sec": time.perf_counter() - start,
+                }
+
+            # Execute the SQL.
+            try:
+                df = self.con.execute(sql).fetchdf()
+            except Exception as e:
+                last_err = str(e)
+                error_context = (
+                    f"Your previous SQL failed with this DuckDB error:\n{e}\n\n"
+                    f"Previous SQL was:\n{sql}\n\n"
+                    "Fix the query and return only the corrected SQL."
+                )
+                continue
+
+            # Success — summarize and return.
+            try:
+                answer = self._summarize(question, sql, df)
+            except Exception as e:
+                answer = (
+                    f"(Summary unavailable — summarization LLM call failed: {e}) "
+                    f"The query returned {len(df)} row(s)."
+                )
+
+            return {
+                "question": question,
+                "sql": sql,
+                "data": df,
+                "answer": answer,
+                "error": None,
+                "attempts": attempt,
+                "elapsed_sec": time.perf_counter() - start,
+            }
+
+        # Exhausted retries.
+        return self._error_result(
+            question, last_sql, last_err or "unknown error", total_attempts, start
+        )
+
+    @staticmethod
+    def _error_result(
+        question: str,
+        sql: str | None,
+        err: str,
+        attempts: int,
+        start: float,
+    ) -> dict[str, Any]:
+        return {
+            "question": question,
+            "sql": sql,
+            "data": None,
+            "answer": None,
+            "error": err,
+            "attempts": attempts,
+            "elapsed_sec": time.perf_counter() - start,
+        }
+
+    def close(self) -> None:
+        try:
+            self.con.close()
+        except Exception:
+            pass
+
+
+# --- CLI smoke test --------------------------------------------------------
+
+def _pretty_print(result: dict[str, Any]) -> None:
+    print()
+    print("-" * 72)
+    print(f"Q: {result['question']}")
+    print(f"Attempts: {result['attempts']}   Elapsed: {result['elapsed_sec']:.1f}s")
+    if result["error"]:
+        print(f"ERROR: {result['error']}")
+        if result["sql"]:
+            print(f"Last SQL:\n{result['sql']}")
+        print("-" * 72)
+        return
+    print(f"SQL:\n{result['sql']}")
+    print(f"\nAnswer: {result['answer']}")
+    df = result["data"]
+    if df is not None and not df.empty:
+        with pd.option_context(
+            "display.max_columns", 10,
+            "display.width", 160,
+            "display.max_colwidth", 40,
+        ):
+            print(f"\nData ({len(df)} rows):")
+            print(df.head(10).to_string(index=False))
+    print("-" * 72)
+
+
+def _cli() -> int:
+    print("Open Payments Agent — REPL. Type 'exit' or Ctrl-C to quit.")
+    try:
+        agent = SQLAgent("config.yaml")
+    except Exception as e:
+        print(f"Failed to initialize agent: {e}", file=sys.stderr)
+        return 1
+
+    history: list[tuple[str, str]] = []
+    try:
+        while True:
+            try:
+                q = input("\n> ").strip()
+            except EOFError:
+                break
+            if not q:
+                continue
+            if q.lower() in {"exit", "quit"}:
+                break
+            result = agent.run_query(q, history)
+            _pretty_print(result)
+            if result.get("answer"):
+                history.append((q, result["answer"]))
+                history = history[-4:]
+    finally:
+        agent.close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(_cli())

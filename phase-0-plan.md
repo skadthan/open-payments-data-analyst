@@ -160,4 +160,4 @@ Phase 0 is complete when:
 - [x] `.venv/` created and all packages installed
 - [x] `qwen2.5-coder:14b` pulled in Ollama (9.0 GB)
 - [x] All 5 acceptance checks pass
-- [ ] Changes committed and pushed to GitHub
+- [x] Changes committed and pushed to GitHub
