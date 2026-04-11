@@ -18,6 +18,7 @@ QUERIES: list[tuple[str, bool]] = [
     ("What are the top 5 therapeutic areas by total research funding in 2024?", False),
     ("How many physicians have ownership interests across all years?", False),
     ("What is the weather in Baltimore?", False),
+    ("In the state of TX, what is the highest paid nature of payment category in General Payment Category in 2024 for the covered recipient type is 'Covered Recipient Physician', also give me the total number of records for that nature of payment category?", False),
 ]
 
 

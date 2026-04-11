@@ -80,3 +80,33 @@ body::before {
   pointer-events: none;
   opacity: 0.9;
 }
+
+/*
+ * Persistent title banner — pins the assistant name just below the
+ * Chainlit top header so the home screen clearly reads
+ * "CMS Open Payments Data Analyst" above/around the logo. Stays
+ * visible during chat mode too, which reinforces the brand through
+ * the whole session. pointer-events: none so it never blocks clicks
+ * on whatever Chainlit renders beneath it.
+ */
+body::after {
+  content: "CMS Open Payments AI Data Analyst";
+  position: fixed;
+  top: 356px;
+  left: 50%;
+  transform: translateX(-50%);
+  font-family: "Source Sans Pro", "Segoe UI", system-ui, -apple-system,
+               sans-serif;
+  font-size: 32px;
+  font-weight: 800;
+  letter-spacing: 0.5px;
+  color: #2a3284;  /* match the gov blue used in the logo wordmark */
+  background: transparent;  /* blend into the home-screen background */
+  z-index: 9998;
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+html[data-theme="dark"] body::after {
+  color: #3d8fc6;  /* lighter blue for dark-mode contrast */
+}
