@@ -149,7 +149,9 @@ Rules:
 5. Always add `LIMIT 100` unless the user explicitly asks for all rows or a specific larger limit.
 6. Monetary amounts: Total_Amount_of_Payment_USDollars (general/research), Total_Amount_Invested_USDollars (ownership).
 7. The paying company is Applicable_Manufacturer_or_Applicable_GPO_Making_Payment_Name.
-8. If the question is not related to Open Payments data, respond with exactly: SELECT 'unsupported' AS note;
+8. Name and string filters: NEVER use case-sensitive `=` on name columns (first name, last name, company name, drug name, hospital name, city, specialty). Always use `ILIKE` so the user does not have to guess the stored casing. For exact-name lookups, use `ILIKE 'value'`; for partial matches, use `ILIKE '%value%'`. This applies to BOTH single-column filters and multi-column filters (e.g. first name AND last name).
+9. If the question is unrelated to CMS Open Payments AND the chat history shows no prior on-topic exchange, respond with exactly: SELECT 'unsupported' AS note;
+   However, if the chat history shows the user is refining, retrying, or follow-up-asking about a prior on-topic question (e.g. "try case-insensitive", "what about 2023?", "show me the chart"), treat the new question as on-topic and answer it.
 """
 
 SUMMARIZE_PROMPT_TEMPLATE = """\
@@ -316,7 +318,13 @@ class SQLAgent:
 
     def _summarize(self, question: str, sql: str, df: pd.DataFrame) -> str:
         if df.empty:
-            return "The query returned no rows."
+            return (
+                "No matching records were found for that query. A few things to try:\n"
+                "- Double-check the spelling of any names, companies, or drugs.\n"
+                "- Try a partial match (e.g. just the last name) — I search case-insensitively.\n"
+                "- Broaden the year range or remove other filters.\n"
+                "- Confirm the entity is in the CMS Open Payments dataset (2021-2024)."
+            )
 
         preview = df.head(20).to_csv(index=False)
         prompt = SUMMARIZE_PROMPT_TEMPLATE.format(
