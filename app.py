@@ -369,7 +369,15 @@ def _build_settings_widgets(provider: str = "ollama") -> list:
 
     models = _build_model_list(provider)
     preset = PROVIDER_DEFAULTS.get(provider, {})
-    default_model = preset.get("default_model", models[0] if models else "")
+    default_model = preset.get("default_model", "")
+
+    # Chainlit's React Select rejects empty-string values, so ensure
+    # every item in the list is non-empty and the initial value is valid.
+    models = [m for m in models if m]  # drop any empty strings
+    if not models:
+        models = [default_model] if default_model else [CONFIG["model"]["name"]]
+    if default_model not in models:
+        default_model = models[0]
 
     widgets = [
         cl.input_widget.Select(
@@ -381,16 +389,18 @@ def _build_settings_widgets(provider: str = "ollama") -> list:
         cl.input_widget.Select(
             id="model",
             label="Model",
-            values=models if models else [default_model],
-            initial_value=default_model if default_model in models else (models[0] if models else ""),
+            values=models,
+            initial_value=default_model,
         ),
     ]
 
+    # API key field — always present for cloud providers, hidden for Ollama.
     if preset.get("needs_api_key", False):
         widgets.append(
             cl.input_widget.TextInput(
                 id="api_key",
                 label="API Key",
+                initial="",
                 placeholder="Enter your API key (stored in session only, never saved)",
             )
         )
@@ -522,10 +532,15 @@ async def on_settings_edit(settings: dict) -> None:
     new_provider = settings.get("provider", "ollama")
     prev_provider = cl.user_session.get("_last_provider") or CONFIG["model"].get("provider", "ollama")
 
+    # Guard against re-entrancy: sending a new ChatSettings triggers
+    # another on_settings_edit, so skip if the provider hasn't changed.
     if new_provider != prev_provider:
         cl.user_session.set("_last_provider", new_provider)
-        refreshed = cl.ChatSettings(inputs=_build_settings_widgets(new_provider))
-        await refreshed.send()
+        try:
+            refreshed = cl.ChatSettings(inputs=_build_settings_widgets(new_provider))
+            await refreshed.send()
+        except Exception:
+            pass  # swallow rebuild errors to avoid crashing the UI
 
 
 async def _answer_question(question: str) -> None:
