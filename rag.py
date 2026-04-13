@@ -457,9 +457,12 @@ SQL_INDICATORS = [
 # Patterns that strongly indicate a policy/documentation question.
 POLICY_INDICATORS = [
     "what is open payments", "what are open payments",
+    "open payments program", "open payments work",
+    "about open payments", "explain open payments",
     "who is required to report", "who must report",
     "reporting requirements", "reporting threshold",
     "covered recipient definition", "what is a covered recipient",
+    "what is a covered", "define covered recipient",
     "sunshine act", "section 6002", "cfr 403",
     "delay in publication", "dispute process",
     "what counts as", "is it required",
@@ -469,7 +472,30 @@ POLICY_INDICATORS = [
     "how does open payments work",
     "what are the rules", "reporting entity",
     "methodology", "data dictionary",
+    "what does cms", "cms require",
+    "transfer of value", "what is a transfer",
+    "applicable manufacturer", "what is an applicable",
+    "group purchasing organization", "what is a gpo",
+    "teaching hospital", "what qualifies",
+    "noncovered recipient", "non-covered recipient",
+    "program year", "publication cycle",
+    "open payments registration",
 ]
+
+
+def _normalize_for_routing(text: str) -> str:
+    """Normalize text for routing: lowercase, strip special chars (™®© etc)."""
+    import unicodedata
+    # Replace trademark/copyright symbols and other special marks with space.
+    cleaned = ""
+    for ch in text:
+        cat = unicodedata.category(ch)
+        if cat.startswith("S") or cat.startswith("M"):  # Symbols, Marks
+            cleaned += " "
+        else:
+            cleaned += ch
+    # Collapse multiple spaces and lowercase.
+    return " ".join(cleaned.lower().split())
 
 
 def classify_question(
@@ -482,7 +508,7 @@ def classify_question(
     if not rag_available:
         return "sql"
 
-    q_lower = question.lower().strip()
+    q_lower = _normalize_for_routing(question)
 
     sql_score = sum(1 for p in SQL_INDICATORS if p in q_lower)
     policy_score = sum(1 for p in POLICY_INDICATORS if p in q_lower)
