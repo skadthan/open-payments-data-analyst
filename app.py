@@ -395,6 +395,17 @@ def _build_settings_widgets() -> list:
 
     return [
         cl.input_widget.Select(
+            id="query_mode",
+            label="Query Mode",
+            items={
+                "Auto (AI decides)": "auto",
+                "Data Analysis (SQL)": "sql",
+                "Program Knowledge (RAG)": "rag",
+            },
+            initial_value="auto",
+            description="Override how questions are routed. Use Auto to let the AI decide, or force SQL/RAG.",
+        ),
+        cl.input_widget.Select(
             id="model",
             label="AI Model",
             items=model_items,
@@ -474,6 +485,7 @@ async def on_chat_start() -> None:
         except Exception:
             rag_instance = None
     cl.user_session.set("rag", rag_instance)
+    cl.user_session.set("query_mode", "auto")
 
     # Send settings panel (gear icon in the UI).
     settings = cl.ChatSettings(inputs=_build_settings_widgets())
@@ -486,12 +498,20 @@ async def on_chat_start() -> None:
 
 @cl.on_settings_update
 async def on_settings_update(settings: dict) -> None:
-    """Re-initialize LLM clients when the user changes model/key."""
+    """Handle changes to query mode and/or model settings."""
+    # --- Query mode ---
+    query_mode = settings.get("query_mode", "auto")
+    prev_mode = cl.user_session.get("query_mode", "auto")
+    cl.user_session.set("query_mode", query_mode)
+    if query_mode != prev_mode:
+        mode_labels = {"auto": "Auto (AI decides)", "sql": "Data Analysis (SQL)", "rag": "Program Knowledge (RAG)"}
+        await cl.Message(content=f"Query mode changed to **{mode_labels.get(query_mode, query_mode)}**").send()
+
+    # --- Model / temperature ---
     agent: SQLAgent | None = cl.user_session.get("agent")
     if agent is None:
         return
 
-    # Model value is "provider/model" (e.g. "openai/gpt-4o").
     model_key = settings.get("model", "")
     if "/" not in model_key:
         await cl.ErrorMessage(content="**Invalid model selection.**").send()
@@ -578,7 +598,17 @@ async def _answer_question(question: str) -> None:
 
     # Query routing: classify as sql, rag, or hybrid.
     rag_instance: DocumentRAG | None = cl.user_session.get("rag")
-    route = classify_question(question, rag_available=rag_instance is not None)
+    query_mode = cl.user_session.get("query_mode", "auto")
+    if query_mode in ("sql", "rag"):
+        route = query_mode
+    else:
+        route = await classify_question(question, agent.llm_sql, rag_available=rag_instance is not None)
+
+    if route == "rag" and rag_instance is None:
+        await cl.Message(
+            content="Program Knowledge mode selected but the knowledge base is not available. Falling back to Data Analysis."
+        ).send()
+        route = "sql"
 
     if route == "rag" and rag_instance is not None:
         answer = await _answer_rag_question(question, agent, rag_instance)

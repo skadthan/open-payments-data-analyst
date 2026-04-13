@@ -320,6 +320,16 @@ Rules:
 14. If the question is unrelated to CMS Open Payments AND the chat history shows no prior on-topic exchange, respond with exactly: SELECT 'unsupported' AS note;
    However, if the chat history shows the user is refining, retrying, or follow-up-asking about a prior on-topic question (e.g. "try case-insensitive", "what about 2023?", "show me the chart"), treat the new question as on-topic and answer it.
 15. Categorical columns with a `VALUES:` list in the schema above store EXACT strings. When filtering on these columns, use the EXACT value from the VALUES list — do NOT use partial ILIKE matches. For example, to find physician payments use `Covered_Recipient_Type = 'Covered Recipient Physician'` — NOT `ILIKE '%Physician%'` (which would also match "Covered Recipient Non-Physician Practitioner"). When the user says "physician" they mean "Covered Recipient Physician"; when they say "non-physician" they mean "Covered Recipient Non-Physician Practitioner"; when they say "teaching hospital" they mean "Covered Recipient Teaching Hospital". Use IN (...) only when the user explicitly wants multiple categories combined.
+16. Case-insensitive GROUP BY: When grouping by ANY text column (specialty, company name, city, payment type, drug/device name, etc.), ALWAYS wrap the column in UPPER() inside GROUP BY to collapse casing variants into one row. Use MAX(original_column) AS alias in SELECT for the display label. Example:
+    ```sql
+    SELECT MAX(Covered_Recipient_Specialty_1) AS Specialty,
+           SUM(Total_Amount_of_Payment_USDollars) AS Total_Payments
+    FROM general_payments_2024
+    GROUP BY UPPER(Covered_Recipient_Specialty_1)
+    ORDER BY Total_Payments DESC
+    LIMIT 100;
+    ```
+    This prevents duplicates like 'Oncology' and 'ONCOLOGY' appearing as separate rows. This rule applies to ALL text GROUP BY columns, not just products (rule 12 already covers products specifically).
 """
 
 # Few-shot examples injected as user/assistant pairs before the real question.
@@ -343,14 +353,14 @@ SELECT 'Grand Total', SUM(amount) FROM (
     SELECT Total_Amount_Invested_USDollars AS amount FROM ownership_payments_2024
 ) AS combined;""",
     ),
-    # 2. Single-table aggregation with manufacturer wildcard ILIKE
+    # 2. Single-table aggregation with manufacturer wildcard ILIKE + case-insensitive GROUP BY
     (
         "Top 5 companies by total general payments in 2023",
         """\
-SELECT Applicable_Manufacturer_or_Applicable_GPO_Making_Payment_Name AS Company,
+SELECT MAX(Applicable_Manufacturer_or_Applicable_GPO_Making_Payment_Name) AS Company,
        SUM(Total_Amount_of_Payment_USDollars) AS Total_Payments
 FROM general_payments_2023
-GROUP BY Applicable_Manufacturer_or_Applicable_GPO_Making_Payment_Name
+GROUP BY UPPER(Applicable_Manufacturer_or_Applicable_GPO_Making_Payment_Name)
 ORDER BY Total_Payments DESC
 LIMIT 5;""",
     ),

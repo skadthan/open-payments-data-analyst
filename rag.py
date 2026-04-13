@@ -413,22 +413,6 @@ class DocumentRAG:
         log.info("Ingestion complete: %d total chunks indexed", total_chunks)
         return total_chunks
 
-    # Categories ordered by priority for general questions.  Higher-priority
-    # categories contain concise, authoritative answers (FAQ, website, data
-    # dictionary) while lower-priority ones are verbose (user guides, law).
-    _PRIORITY_CATEGORIES = ["faq", "website", "data_dictionary", "law_policy", "user_guide"]
-
-    # Score bonus for high-priority categories so concise, authoritative
-    # sources rank above verbose user-guide pages.
-    _CATEGORY_BOOST = {
-        "faq": 0.15,
-        "website": 0.15,
-        "data_dictionary": 0.10,
-        "law_policy": 0.0,
-        "user_guide": -0.05,
-        "other": 0.0,
-    }
-
     def query(
         self,
         question: str,
@@ -438,8 +422,8 @@ class DocumentRAG:
         """Retrieve the most relevant document chunks for *question*.
 
         Returns a list of dicts with keys: text, source_file, page_number, score.
-        When *category* is None, results from all categories are merged with
-        priority boosting so FAQ/website content ranks above verbose guides.
+        Uses a single unified vector search across all categories, ranked
+        purely by cosine similarity so no source type is artificially suppressed.
         """
         k = top_k or self._top_k
         col = self._get_collection()
@@ -457,7 +441,6 @@ class DocumentRAG:
             return []
 
         if category:
-            # Single-category query — no boosting needed.
             results = col.query(
                 query_embeddings=[q_embedding],
                 n_results=k,
@@ -465,26 +448,27 @@ class DocumentRAG:
             )
             return self._format_results(results)
 
-        # Multi-category query with priority boosting.  Query each priority
-        # category separately (top-3 each), merge, re-rank with boosts.
-        candidates: list[dict] = []
-        for cat in self._PRIORITY_CATEGORIES:
-            try:
-                results = col.query(
-                    query_embeddings=[q_embedding],
-                    n_results=3,
-                    where={"category": cat},
-                )
-                for item in self._format_results(results):
-                    boost = self._CATEGORY_BOOST.get(item["category"], 0.0)
-                    item["boosted_score"] = item["score"] + boost
-                    candidates.append(item)
-            except Exception:
-                continue
+        # Unified query — let cosine similarity decide relevance across all
+        # categories.  Fetch extra so we can de-duplicate near-identical chunks
+        # from the same source page.
+        results = col.query(
+            query_embeddings=[q_embedding],
+            n_results=k * 3,
+        )
+        candidates = self._format_results(results)
 
-        # Sort by boosted score and return top-k.
-        candidates.sort(key=lambda x: x["boosted_score"], reverse=True)
-        return candidates[:k]
+        # Light dedup: if two chunks share the same source_file + page, keep
+        # only the higher-scoring one to improve source diversity.
+        seen: set[tuple[str, int]] = set()
+        deduped: list[dict] = []
+        for item in candidates:
+            key = (item["source_file"], item["page_number"])
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(item)
+
+        return deduped[:k]
 
     @staticmethod
     def _format_results(results: dict) -> list[dict]:
@@ -558,93 +542,51 @@ def build_rag_prompt(question: str, chunks: list[dict]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Query routing
+# Query routing — LLM-based intent classification
 # ---------------------------------------------------------------------------
 
-# Patterns that strongly indicate a data/SQL question.
-SQL_INDICATORS = [
-    "how much", "how many", "total", "top ", "compare",
-    "trend", "by year", "by state", "by specialty",
-    "which companies", "who received", "payments to",
-    "spending on", "average", "count of", "sum of",
-    "highest", "lowest", "most", "least",
-    "breakdown", "distribution", "per year",
-    "in 2018", "in 2019", "in 2020", "in 2021",
-    "in 2022", "in 2023", "in 2024",
-]
+ROUTE_PROMPT = """\
+You are a query router for a CMS Open Payments chatbot. Classify the user's question into exactly one category:
 
-# Patterns that strongly indicate a policy/documentation question.
-POLICY_INDICATORS = [
-    "what is open payments", "what are open payments",
-    "open payments program", "open payments work",
-    "about open payments", "explain open payments",
-    "who is required to report", "who must report",
-    "reporting requirements", "reporting threshold",
-    "covered recipient definition", "what is a covered recipient",
-    "what is a covered", "define covered recipient",
-    "sunshine act", "section 6002", "cfr 403",
-    "delay in publication", "dispute process",
-    "what counts as", "is it required",
-    "exemption", "exempt from",
-    "de minimis", "penalty", "enforcement",
-    "compliance", "what does the law",
-    "how does open payments work",
-    "what are the rules", "reporting entity",
-    "methodology", "data dictionary",
-    "what does cms", "cms require",
-    "transfer of value", "what is a transfer",
-    "applicable manufacturer", "what is an applicable",
-    "group purchasing organization", "what is a gpo",
-    "teaching hospital", "what qualifies",
-    "noncovered recipient", "non-covered recipient",
-    "program year", "publication cycle",
-    "open payments registration",
-    "affordable care act", "aca ", "section 6002",
-    "physician payments sunshine act",
-    "what types of payments", "what kind of payments",
-    "who reports", "who has to report",
-    "what must be reported", "what is reported",
-    "dispute resolution", "review and dispute",
-    "attestation", "data submission",
-]
+- **sql**: The question asks for specific data, numbers, statistics, rankings, comparisons, or trends from the Open Payments database (payments to physicians/hospitals by drug/device companies, 2018-2024).
+- **rag**: The question asks about CMS Open Payments program rules, policies, definitions, processes, history, legislation (Sunshine Act, ACA), reporting requirements, deadlines, stakeholders, or general "what is" / "how does it work" questions about the program.
+- **hybrid**: The question asks for data AND references program concepts that need policy context to answer correctly.
+
+Respond with ONLY one word: sql, rag, or hybrid
+
+Question: {question}
+"""
+
+_VALID_ROUTES = {"sql", "rag", "hybrid"}
 
 
-def _normalize_for_routing(text: str) -> str:
-    """Normalize text for routing: lowercase, strip special chars (™®© etc)."""
-    import unicodedata
-    # Replace trademark/copyright symbols and other special marks with space.
-    cleaned = ""
-    for ch in text:
-        cat = unicodedata.category(ch)
-        if cat.startswith("S") or cat.startswith("M"):  # Symbols, Marks
-            cleaned += " "
-        else:
-            cleaned += ch
-    # Collapse multiple spaces and lowercase.
-    return " ".join(cleaned.lower().split())
-
-
-def classify_question(
-    question: str, rag_available: bool = False
+async def classify_question(
+    question: str,
+    llm,
+    rag_available: bool = False,
 ) -> str:
-    """Classify a question as 'sql', 'rag', or 'hybrid'.
+    """Classify a question as 'sql', 'rag', or 'hybrid' using the LLM.
 
-    Returns 'sql' if RAG is not available, regardless of question type.
+    Returns 'sql' if RAG is not available or if the LLM call fails.
     """
     if not rag_available:
         return "sql"
 
-    q_lower = _normalize_for_routing(question)
+    try:
+        from langchain_core.messages import HumanMessage
 
-    sql_score = sum(1 for p in SQL_INDICATORS if p in q_lower)
-    policy_score = sum(1 for p in POLICY_INDICATORS if p in q_lower)
+        prompt = ROUTE_PROMPT.format(question=question)
+        response = await llm.ainvoke([HumanMessage(content=prompt)])
+        route = response.content.strip().lower().split()[0]
+        # Strip any trailing punctuation (e.g. "sql." → "sql").
+        route = route.rstrip(".,;:!?")
+        if route in _VALID_ROUTES:
+            log.info("LLM routed %r -> %s", question, route)
+            return route
+        log.warning("LLM returned invalid route %r, defaulting to sql", route)
+    except Exception as e:
+        log.warning("Route classification failed (%s), defaulting to sql", e)
 
-    if policy_score >= 2 and sql_score == 0:
-        return "rag"
-    if policy_score >= 1 and sql_score >= 1:
-        return "hybrid"
-    if policy_score >= 1 and sql_score == 0:
-        return "rag"
     return "sql"
 
 
