@@ -57,7 +57,7 @@ GREETING = (
     "I can answer natural-language questions about the CMS Open Payments "
     "program — financial relationships between pharmaceutical and medical "
     "device manufacturers and U.S. physicians and teaching hospitals from "
-    "**2021 through 2024** (about 55 million records across general "
+    "**2018 through 2024** (about 80+ million records across general "
     "payments, research payments, and ownership interests).\n\n"
     "Pick one of the starter prompts below, or type your own question."
 )
@@ -81,7 +81,7 @@ STARTERS: list[dict[str, str]] = [
     },
     {
         "label": "Yearly trend",
-        "message": "Compare total general payments by year from 2021 to 2024",
+        "message": "Compare total general payments by year from 2018 to 2024",
     },
 ]
 
@@ -576,7 +576,7 @@ async def _answer_question(question: str) -> None:
                 "I couldn't answer that after "
                 f"{prep['attempts']} attempt(s). This usually means the "
                 "question is ambiguous or references data that isn't in "
-                "the CMS Open Payments dataset (2021–2024).\n\n"
+                "the CMS Open Payments dataset (2018–2024).\n\n"
                 "**Things to try:**\n"
                 "- Rephrase the question more specifically (name a year, "
                 "  company, specialty, or state)\n"

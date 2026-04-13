@@ -218,7 +218,7 @@ KEY_COLUMNS: dict[str, list[str]] = {
 # --- Prompt templates ------------------------------------------------------
 
 SYSTEM_PROMPT_TEMPLATE = """\
-You are a DuckDB SQL analyst for the CMS Open Payments dataset (calendar years 2021-2024).
+You are a DuckDB SQL analyst for the CMS Open Payments dataset (calendar years 2018-2024).
 Your job is to translate the user's question into ONE DuckDB SQL query.
 
 Dataset overview:
@@ -240,7 +240,7 @@ Dataset overview:
 Schema (key columns only; more columns exist but rarely matter):
 {compact_schema}
 
-Per-year tables (replace YYYY with 2021, 2022, 2023, or 2024):
+Per-year tables (replace YYYY with 2018, 2019, 2020, 2021, 2022, 2023, or 2024):
   general_payments_YYYY
   research_payments_YYYY
   ownership_payments_YYYY
@@ -389,7 +389,7 @@ would naturally ask next, given that answer. Rules:
 - One question per line.
 - No numbering, no bullets, no quotes, no prose before or after.
 - Each question max 70 characters.
-- Questions must be about the same CMS Open Payments dataset (2021-2024).
+- Questions must be about the same CMS Open Payments dataset (2018-2024).
 - Prefer drill-downs (by year, state, specialty, product) over brand-new topics.
 """
 
@@ -398,12 +398,12 @@ EMPTY_RESULT_MESSAGE = (
     "- Double-check the spelling of any names, companies, or drugs.\n"
     "- Try a partial match (e.g. just the last name) — I search case-insensitively.\n"
     "- Broaden the year range or remove other filters.\n"
-    "- Confirm the entity is in the CMS Open Payments dataset (2021-2024)."
+    "- Confirm the entity is in the CMS Open Payments dataset (2018-2024)."
 )
 
 UNSUPPORTED_MESSAGE = (
     "I can only answer questions about the CMS Open Payments dataset "
-    "(pharmaceutical and medical device payments to physicians, 2021-2024). "
+    "(pharmaceutical and medical device payments to physicians, 2018-2024). "
     "Please rephrase your question to focus on that data."
 )
 
