@@ -1,0 +1,27 @@
+  /btw I would like to understand the parquet files role in duckdb, are these files mandatory to query the data for DuckDB?
+
+    Parquet files and DuckDB in this project
+
+    Role of the Parquet files here: In this project, the CMS Open Payments CSV files are ingested (via ingest.py) into Parquet files, and DuckDB is pointed at those Parquet files through views (like general_payments_2024, all_general_payments, etc.). When you query
+    SELECT * FROM all_general_payments, DuckDB reads directly from the underlying Parquet files on disk — the views are essentially a thin SQL layer over read_parquet(...).
+
+    Are Parquet files mandatory for DuckDB? No. DuckDB is a general-purpose analytical database and supports several storage options:
+
+    1. Native DuckDB tables — data stored inside the .duckdb file itself (a single binary file). No Parquet needed.
+    2. Parquet files — queried in-place via read_parquet() or as views/external tables. This is what this project uses.
+    3. CSV files — queried directly via read_csv() / read_csv_auto(), no conversion step needed.
+    4. JSON, Arrow, Iceberg, Delta Lake — all supported.
+    5. Other databases — Postgres, MySQL, SQLite via extensions.
+
+    Why this project chose Parquet:
+
+    - Columnar + compressed — 55M rows of CMS data fit in a fraction of the raw CSV size, and analytical queries (SUM, GROUP BY, COUNT) only read the columns they need.
+    - Fast scans — DuckDB + Parquet is the combination benchmarks consistently show as near-optimal for OLAP workloads on a laptop. That's why the R3.1 performance footer shows sub-second answers on tens of millions of rows.
+    - Portable & inspectable — Parquet files are a standard format. Other tools (pandas, Spark, Arrow, Polars) can read the same files without DuckDB involvement.
+    - Separation of concerns — the .duckdb file stays small (just views + metadata), and the heavy data lives in Parquet files under data/. Rebuilding the DB is fast because it doesn't re-materialize rows, just re-points the views.
+
+    Could this project work without Parquet? Yes — you could alternatively:
+    - CREATE TABLE general_payments_2024 AS SELECT * FROM read_csv('...') to load everything into the .duckdb file itself (slower ingest, single-file portability, but loses the column-pruning benefits on re-query).
+    - Or point views at the raw CSVs directly (CREATE VIEW ... AS SELECT * FROM read_csv_auto('...')). Queries would be noticeably slower because CSV has to be parsed on every scan.
+
+    So the Parquet files aren't a DuckDB requirement — they're a performance and architecture choice specific to this project's "local 55M-row analytics in under 2 seconds" goal.
