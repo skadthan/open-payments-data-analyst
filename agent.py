@@ -83,7 +83,7 @@ PROVIDER_DEFAULTS: dict[str, dict[str, Any]] = {
         "needs_api_key": True,
     },
     "deepseek": {
-        "models": ["deepseek-chat", "deepseek-reasoner"],
+        "models": ["deepseek-chat", "deepseek-reasoner", "deepseek-v3-0324"],
         "default_model": "deepseek-chat",
         "base_url": "https://api.deepseek.com/v1",
         "needs_api_key": True,

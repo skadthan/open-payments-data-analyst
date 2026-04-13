@@ -357,11 +357,11 @@ _PROVIDER_LABELS = {
 
 
 def _build_all_model_items() -> dict[str, str]:
-    """Build a combined {value: label} dict of every model across all providers.
+    """Build a combined ``{label: value}`` dict for the model Select widget.
 
-    Values are ``provider/model`` (e.g. ``openai/gpt-4o``).
-    Labels are human-readable (e.g. ``OpenAI — gpt-4o``).
-    Ollama models are queried live from the local server.
+    Chainlit's ``Select(items=...)`` maps ``{label: value}`` — the *label*
+    is shown in the UI and the *value* is returned in settings.  We want
+    the returned value to be ``provider/model`` so the handler can parse it.
     """
     items: dict[str, str] = {}
     for provider, preset in PROVIDER_DEFAULTS.items():
@@ -375,8 +375,9 @@ def _build_all_model_items() -> dict[str, str]:
         else:
             models = preset.get("models", [])
         for m in models:
-            key = f"{provider}/{m}"
-            items[key] = f"{label_prefix} — {m}"
+            label = f"{label_prefix} — {m}"
+            value = f"{provider}/{m}"
+            items[label] = value
     return items
 
 
@@ -387,16 +388,16 @@ def _build_settings_widgets() -> list:
     # Default selection: current Ollama model from config.
     default_provider = CONFIG["model"].get("provider", "ollama")
     default_model = CONFIG["model"]["name"]
-    default_key = f"{default_provider}/{default_model}"
-    if default_key not in model_items:
-        default_key = next(iter(model_items))
+    default_value = f"{default_provider}/{default_model}"
+    if default_value not in model_items.values():
+        default_value = next(iter(model_items.values()))
 
     return [
         cl.input_widget.Select(
             id="model",
             label="AI Model",
             items=model_items,
-            initial_value=default_key,
+            initial_value=default_value,
             description="Pick a provider and model. Cloud models require an API key below.",
         ),
         cl.input_widget.TextInput(
