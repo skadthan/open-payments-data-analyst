@@ -1,6 +1,7 @@
 # Large dataset files - do not commit to git
 Datasets/
 data/
+ProgramData/
 
 # Python
 __pycache__/

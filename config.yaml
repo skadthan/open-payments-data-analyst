@@ -21,6 +21,16 @@ ingestion:
   row_group_size: 500000              # rows per Parquet row group
   sample_size: 10000                  # CSV auto-detect sample size for DuckDB
 
+rag:
+  enabled: true
+  pdf_dir: ./ProgramData
+  vectorstore_dir: ./data/vectorstore
+  embedding_model: nomic-embed-text
+  top_k: 5
+  max_file_size_mb: 50                # skip PDFs larger than this (e.g. 207MB Federal Register)
+  chunk_size: 3200                    # characters per chunk (~800 tokens)
+  chunk_overlap: 200                  # character overlap between chunks
+
 ui:
   title: "Open Payments Data Analyst"
   max_display_rows: 1000

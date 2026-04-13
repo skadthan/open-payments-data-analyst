@@ -37,6 +37,7 @@ import plotly.express as px
 import yaml
 
 from agent import SQLAgent, PROVIDER_DEFAULTS, get_ollama_models, create_llm
+from rag import DocumentRAG, classify_question, build_rag_prompt
 
 
 # --- Config (loaded once at import time) -----------------------------------
@@ -463,6 +464,17 @@ async def on_chat_start() -> None:
     cl.user_session.set("session_log", [])
     cl.user_session.set("corrections", [])
 
+    # Initialize RAG (optional — SQL pipeline works without it).
+    rag_instance = None
+    if CONFIG.get("rag", {}).get("enabled", False):
+        try:
+            rag_instance = DocumentRAG(CONFIG)
+            if not rag_instance.is_available():
+                rag_instance = None
+        except Exception:
+            rag_instance = None
+    cl.user_session.set("rag", rag_instance)
+
     # Send settings panel (gear icon in the UI).
     settings = cl.ChatSettings(inputs=_build_settings_widgets())
     await settings.send()
@@ -517,6 +529,41 @@ async def on_settings_update(settings: dict) -> None:
     ).send()
 
 
+async def _answer_rag_question(question: str, agent: SQLAgent, rag_instance: DocumentRAG) -> str | None:
+    """Handle a pure-RAG question. Returns the answer text, or None on failure."""
+    async with cl.Step(name="Searching CMS documentation", type="tool") as step:
+        chunks = await cl.make_async(rag_instance.query)(question)
+        if not chunks:
+            step.output = "No relevant documentation found."
+            return None
+        sources = set()
+        for c in chunks:
+            sources.add(f"{c['source_file']} (p.{c['page_number']})")
+        step.output = f"Found {len(chunks)} relevant excerpts from: {', '.join(sorted(sources))}"
+
+    prompt = build_rag_prompt(question, chunks)
+    msg = cl.Message(content="")
+    parts: list[str] = []
+    try:
+        async for chunk_text in agent.stream_rag_answer(prompt):
+            parts.append(chunk_text)
+            await msg.stream_token(chunk_text)
+    except Exception as e:
+        fallback = f"(RAG answer unavailable — LLM call failed: {e})"
+        parts = [fallback]
+        msg.content = fallback
+
+    # Source attribution footer.
+    source_lines = []
+    for c in chunks[:3]:  # Top 3 sources.
+        source_lines.append(f"- {c['source_file']}, page {c['page_number']}")
+    footer = "\n\n---\n📚 **Sources:**\n" + "\n".join(source_lines)
+    msg.content += footer
+    parts.append(footer)
+    await msg.send()
+    return "".join(parts).strip()
+
+
 async def _answer_question(question: str) -> None:
     """Run a single user question end-to-end (used by on_message and
     the follow-up action callback in Phase 5.B)."""
@@ -528,6 +575,49 @@ async def _answer_question(question: str) -> None:
         return
 
     chat_history: list[tuple[str, str]] = cl.user_session.get("chat_history") or []
+
+    # Query routing: classify as sql, rag, or hybrid.
+    rag_instance: DocumentRAG | None = cl.user_session.get("rag")
+    route = classify_question(question, rag_available=rag_instance is not None)
+
+    if route == "rag" and rag_instance is not None:
+        answer = await _answer_rag_question(question, agent, rag_instance)
+        if answer:
+            chat_history.append((question, answer))
+            cl.user_session.set("chat_history", chat_history[-5:])
+            session_log: list[dict[str, Any]] = cl.user_session.get("session_log") or []
+            session_log.append({
+                "question": question,
+                "sql": None,
+                "answer": answer,
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            })
+            cl.user_session.set("session_log", session_log)
+            return
+        # If RAG returned nothing, fall through to SQL path.
+
+    # For hybrid route, retrieve RAG context and inject it into the agent's
+    # system prompt temporarily so the LLM can use domain knowledge.
+    rag_context_injected = False
+    if route == "hybrid" and rag_instance is not None:
+        try:
+            chunks = rag_instance.query(question, top_k=3)
+            if chunks:
+                context_parts = []
+                for c in chunks:
+                    text_snippet = c["text"][:500]
+                    context_parts.append(
+                        f"[{c['source_file']}, p.{c['page_number']}]: {text_snippet}"
+                    )
+                rag_supplement = (
+                    "\n\nRelevant CMS documentation for context:\n"
+                    + "\n---\n".join(context_parts)
+                )
+                agent._original_system_prompt = agent.system_prompt
+                agent.system_prompt = agent.system_prompt + rag_supplement
+                rag_context_injected = True
+        except Exception:
+            pass  # Hybrid context is optional; SQL still works without it.
 
     # Step 1: SQL generation + execution (visible as a collapsible step).
     async with cl.Step(name="Generating SQL", type="tool") as step:
@@ -724,6 +814,10 @@ async def _answer_question(question: str) -> None:
                 content="**You might also ask:**",
                 actions=actions,
             ).send()
+
+    # Restore original system prompt if hybrid RAG context was injected.
+    if rag_context_injected:
+        agent.system_prompt = agent._original_system_prompt
 
 
 @cl.action_callback("show_sql")

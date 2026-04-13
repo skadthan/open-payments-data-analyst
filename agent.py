@@ -214,6 +214,28 @@ KEY_COLUMNS: dict[str, list[str]] = {
     ],
 }
 
+# Categorical columns whose distinct values should be queried at startup and
+# injected into the system prompt so the LLM uses exact values instead of
+# ambiguous ILIKE wildcards (e.g. "Covered Recipient Physician" not "%Physician%").
+CATEGORICAL_COLUMNS: dict[str, list[str]] = {
+    "general_payments": [
+        "Covered_Recipient_Type",
+        "Nature_of_Payment_or_Transfer_of_Value",
+        "Form_of_Payment_or_Transfer_of_Value",
+        "Physician_Ownership_Indicator",
+    ],
+    "research_payments": [
+        "Expenditure_Category1",
+    ],
+    "ownership_payments": [
+        "Interest_Held_by_Physician_or_an_Immediate_Family_Member",
+    ],
+    "removed_deleted": [
+        "Change_Type",
+        "Payment_Type",
+    ],
+}
+
 
 # --- Prompt templates ------------------------------------------------------
 
@@ -297,6 +319,7 @@ Rules:
     Then the outer query can safely reference `amount`. Never reference the original differing column names after a UNION ALL.
 14. If the question is unrelated to CMS Open Payments AND the chat history shows no prior on-topic exchange, respond with exactly: SELECT 'unsupported' AS note;
    However, if the chat history shows the user is refining, retrying, or follow-up-asking about a prior on-topic question (e.g. "try case-insensitive", "what about 2023?", "show me the chart"), treat the new question as on-topic and answer it.
+15. Categorical columns with a `VALUES:` list in the schema above store EXACT strings. When filtering on these columns, use the EXACT value from the VALUES list — do NOT use partial ILIKE matches. For example, to find physician payments use `Covered_Recipient_Type = 'Covered Recipient Physician'` — NOT `ILIKE '%Physician%'` (which would also match "Covered Recipient Non-Physician Practitioner"). When the user says "physician" they mean "Covered Recipient Physician"; when they say "non-physician" they mean "Covered Recipient Non-Physician Practitioner"; when they say "teaching hospital" they mean "Covered Recipient Teaching Hospital". Use IN (...) only when the user explicitly wants multiple categories combined.
 """
 
 # Few-shot examples injected as user/assistant pairs before the real question.
@@ -340,6 +363,15 @@ FROM all_general_payments
 WHERE Program_Year IN (2021, 2024)
 GROUP BY Program_Year
 ORDER BY Program_Year
+LIMIT 100;""",
+    ),
+    # 4. Categorical column exact-match (NOT ILIKE wildcard)
+    (
+        "How much did physicians receive in general payments in 2024?",
+        """\
+SELECT SUM(Total_Amount_of_Payment_USDollars) AS Total_Payments
+FROM general_payments_2024
+WHERE Covered_Recipient_Type = 'Covered Recipient Physician'
 LIMIT 100;""",
     ),
 ]
@@ -473,6 +505,10 @@ class SchemaManager:
         if dictionaries_dir:
             self._load_descriptions(Path(dictionaries_dir))
 
+        # Load distinct values for categorical columns.
+        self._distinct_values: dict[tuple[str, str], list[str]] = {}
+        self._load_distinct_values(con)
+
     def _load_descriptions(self, base_dir: Path) -> None:
         """Load column descriptions from the most recent year's data dictionary."""
         # Use 2024 (most recent) — descriptions are stable across years.
@@ -497,6 +533,27 @@ class SchemaManager:
             except Exception:
                 continue
 
+    def _load_distinct_values(
+        self, con: duckdb.DuckDBPyConnection
+    ) -> None:
+        """Query DuckDB for distinct values of low-cardinality categorical columns."""
+        for table_type, columns in CATEGORICAL_COLUMNS.items():
+            view = self._REP_VIEW.get(table_type)
+            if not view:
+                continue
+            for col in columns:
+                try:
+                    rows = con.execute(
+                        f'SELECT DISTINCT "{col}" FROM {view} '
+                        f'WHERE "{col}" IS NOT NULL '
+                        f'ORDER BY "{col}" LIMIT 50'
+                    ).fetchall()
+                    values = [str(r[0]) for r in rows]
+                    if values:
+                        self._distinct_values[(table_type, col)] = values
+                except Exception:
+                    continue
+
     def compact_schema(self) -> str:
         lines: list[str] = []
         for table_type, cols in KEY_COLUMNS.items():
@@ -508,6 +565,11 @@ class SchemaManager:
                     lines.append(f"    - {col} [{dtype}] — {desc}")
                 else:
                     lines.append(f"    - {col} [{dtype}]")
+                # Append distinct values for categorical columns.
+                values = self._distinct_values.get((table_type, col))
+                if values:
+                    quoted = ", ".join(f'"{v}"' for v in values)
+                    lines.append(f"      VALUES: {quoted}")
         return "\n".join(lines)
 
 
@@ -662,6 +724,13 @@ class SQLAgent:
         success path with a non-empty DataFrame.
         """
         prompt = self._summary_prompt(question, sql, df)
+        async for chunk in self.llm_summary.astream([HumanMessage(content=prompt)]):
+            text = getattr(chunk, "content", "") or ""
+            if text:
+                yield text
+
+    async def stream_rag_answer(self, prompt: str):
+        """Async generator yielding RAG answer chunks from the summary LLM."""
         async for chunk in self.llm_summary.astream([HumanMessage(content=prompt)]):
             text = getattr(chunk, "content", "") or ""
             if text:
