@@ -128,18 +128,79 @@ def _extract_pdf_pages(
 # ---------------------------------------------------------------------------
 
 
-def _embed_texts(texts: list[str], model: str, base_url: str) -> list[list[float]]:
-    """Embed a batch of texts using the Ollama /api/embed endpoint."""
+def _sanitize_text(text: str) -> str:
+    """Remove characters that can cause embedding API failures."""
+    # Replace common problematic Unicode with ASCII equivalents.
+    replacements = {
+        "\u2013": "-", "\u2014": "-",  # en-dash, em-dash
+        "\u2018": "'", "\u2019": "'",  # curly single quotes
+        "\u201c": '"', "\u201d": '"',  # curly double quotes
+        "\u2022": "-",  # bullet
+        "\u00a0": " ",  # non-breaking space
+        "\u2026": "...",  # ellipsis
+        "\ufffd": "",  # replacement character
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    # Strip any remaining non-ASCII control characters (keep printable Unicode).
+    return "".join(ch for ch in text if ch == "\n" or ch == "\t" or (ord(ch) >= 32))
+
+
+def _embed_texts_single(text: str, model: str, base_url: str) -> list[float] | None:
+    """Embed a single text, returning None on failure."""
     import urllib.request
 
     url = f"{base_url}/api/embed"
-    payload = json.dumps({"model": model, "input": texts}).encode()
+    sanitized = _sanitize_text(text)
+    payload = json.dumps({"model": model, "input": [sanitized]}).encode()
     req = urllib.request.Request(
         url, data=payload, headers={"Content-Type": "application/json"}
     )
-    with urllib.request.urlopen(req, timeout=300) as resp:
-        data = json.loads(resp.read())
-    return data["embeddings"]
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read())
+        return data["embeddings"][0]
+    except Exception:
+        return None
+
+
+def _embed_texts(
+    texts: list[str], model: str, base_url: str
+) -> tuple[list[list[float]], list[int] | None]:
+    """Embed a batch of texts using the Ollama /api/embed endpoint.
+
+    Returns (embeddings, failed_indices). *failed_indices* is None when the
+    whole batch succeeded, or a list of indices that were skipped when the
+    batch had to fall back to per-chunk embedding.
+    """
+    import urllib.request
+
+    sanitized = [_sanitize_text(t) for t in texts]
+    url = f"{base_url}/api/embed"
+    payload = json.dumps({"model": model, "input": sanitized}).encode()
+    req = urllib.request.Request(
+        url, data=payload, headers={"Content-Type": "application/json"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            data = json.loads(resp.read())
+        return data["embeddings"], None
+    except Exception:
+        # Batch failed — fall back to one-at-a-time embedding.
+        log.warning("Batch embedding failed, falling back to per-chunk embedding")
+        results: list[list[float]] = []
+        ok_indices: list[int] = []
+        for i, t in enumerate(sanitized):
+            emb = _embed_texts_single(t, model, base_url)
+            if emb is None:
+                log.warning("Skipping chunk %d that failed to embed: %s...", i, t[:80])
+            else:
+                results.append(emb)
+                ok_indices.append(i)
+        if not results:
+            raise RuntimeError("All chunks in batch failed to embed")
+        failed = [i for i in range(len(sanitized)) if i not in ok_indices]
+        return results, failed
 
 
 def _check_model_available(model: str, base_url: str) -> bool:
@@ -242,14 +303,16 @@ class DocumentRAG:
             )
             col = self._collection
 
-        # Build a manifest of PDFs to process.
+        # Build a manifest of PDFs and text files to process.
         pdf_files = sorted(self._pdf_dir.rglob("*.pdf"))
-        if not pdf_files:
-            log.warning("No PDF files found in %s", self._pdf_dir)
+        txt_files = sorted(self._pdf_dir.rglob("*.txt"))
+        all_files = pdf_files + txt_files
+        if not all_files:
+            log.warning("No PDF or text files found in %s", self._pdf_dir)
             return 0
 
         total_chunks = 0
-        for pdf_path in pdf_files:
+        for pdf_path in all_files:
             size_mb = pdf_path.stat().st_size / (1024 * 1024)
             if size_mb > self._max_file_size_mb:
                 log.info(
@@ -260,9 +323,12 @@ class DocumentRAG:
                 )
                 continue
 
-            # Determine category from parent directory.
+            # Determine category from parent directory or file name.
             parent_name = pdf_path.parent.name.lower()
-            category = _DIR_TO_CATEGORY.get(parent_name, "other")
+            if "cms_website" in pdf_path.name.lower():
+                category = "website"
+            else:
+                category = _DIR_TO_CATEGORY.get(parent_name, "other")
 
             # Check if already indexed (by file hash).
             file_hash = _file_hash(pdf_path)
@@ -273,9 +339,13 @@ class DocumentRAG:
 
             log.info("Processing: %s (%.1f MB, category=%s)", pdf_path.name, size_mb, category)
 
-            # Extract text page by page.
+            # Extract text — PDF page by page, text files as a single "page".
             try:
-                pages = _extract_pdf_pages(pdf_path)
+                if pdf_path.suffix.lower() == ".txt":
+                    text = pdf_path.read_text(encoding="utf-8", errors="ignore")
+                    pages = [(1, text)] if text.strip() else []
+                else:
+                    pages = _extract_pdf_pages(pdf_path)
             except Exception as e:
                 log.error("Failed to parse %s: %s", pdf_path.name, e)
                 continue
@@ -317,12 +387,18 @@ class DocumentRAG:
                 batch = all_chunks[i : i + batch_size]
                 texts = [c["text"] for c in batch]
                 try:
-                    embeddings = _embed_texts(
+                    embeddings, failed = _embed_texts(
                         texts, self._embedding_model, self._base_url
                     )
                 except Exception as e:
                     log.error("Embedding failed at batch %d: %s", i, e)
                     continue
+
+                if failed:
+                    # Some chunks were skipped — filter batch to only succeeded.
+                    ok_set = set(range(len(batch))) - set(failed)
+                    batch = [batch[j] for j in sorted(ok_set)]
+                    texts = [c["text"] for c in batch]
 
                 col.add(
                     ids=[c["id"] for c in batch],
@@ -337,6 +413,22 @@ class DocumentRAG:
         log.info("Ingestion complete: %d total chunks indexed", total_chunks)
         return total_chunks
 
+    # Categories ordered by priority for general questions.  Higher-priority
+    # categories contain concise, authoritative answers (FAQ, website, data
+    # dictionary) while lower-priority ones are verbose (user guides, law).
+    _PRIORITY_CATEGORIES = ["faq", "website", "data_dictionary", "law_policy", "user_guide"]
+
+    # Score bonus for high-priority categories so concise, authoritative
+    # sources rank above verbose user-guide pages.
+    _CATEGORY_BOOST = {
+        "faq": 0.15,
+        "website": 0.15,
+        "data_dictionary": 0.10,
+        "law_policy": 0.0,
+        "user_guide": -0.05,
+        "other": 0.0,
+    }
+
     def query(
         self,
         question: str,
@@ -346,6 +438,8 @@ class DocumentRAG:
         """Retrieve the most relevant document chunks for *question*.
 
         Returns a list of dicts with keys: text, source_file, page_number, score.
+        When *category* is None, results from all categories are merged with
+        priority boosting so FAQ/website content ranks above verbose guides.
         """
         k = top_k or self._top_k
         col = self._get_collection()
@@ -354,24 +448,49 @@ class DocumentRAG:
 
         # Embed the question.
         try:
-            q_embedding = _embed_texts(
+            embeddings, _ = _embed_texts(
                 [question], self._embedding_model, self._base_url
-            )[0]
+            )
+            q_embedding = embeddings[0]
         except Exception as e:
             log.error("Failed to embed query: %s", e)
             return []
 
-        where_filter = {"category": category} if category else None
+        if category:
+            # Single-category query — no boosting needed.
+            results = col.query(
+                query_embeddings=[q_embedding],
+                n_results=k,
+                where={"category": category},
+            )
+            return self._format_results(results)
 
-        results = col.query(
-            query_embeddings=[q_embedding],
-            n_results=k,
-            where=where_filter,
-        )
+        # Multi-category query with priority boosting.  Query each priority
+        # category separately (top-3 each), merge, re-rank with boosts.
+        candidates: list[dict] = []
+        for cat in self._PRIORITY_CATEGORIES:
+            try:
+                results = col.query(
+                    query_embeddings=[q_embedding],
+                    n_results=3,
+                    where={"category": cat},
+                )
+                for item in self._format_results(results):
+                    boost = self._CATEGORY_BOOST.get(item["category"], 0.0)
+                    item["boosted_score"] = item["score"] + boost
+                    candidates.append(item)
+            except Exception:
+                continue
 
+        # Sort by boosted score and return top-k.
+        candidates.sort(key=lambda x: x["boosted_score"], reverse=True)
+        return candidates[:k]
+
+    @staticmethod
+    def _format_results(results: dict) -> list[dict]:
+        """Convert ChromaDB query results to a list of dicts."""
         if not results or not results["documents"] or not results["documents"][0]:
             return []
-
         output = []
         for doc, meta, dist in zip(
             results["documents"][0],
@@ -480,6 +599,13 @@ POLICY_INDICATORS = [
     "noncovered recipient", "non-covered recipient",
     "program year", "publication cycle",
     "open payments registration",
+    "affordable care act", "aca ", "section 6002",
+    "physician payments sunshine act",
+    "what types of payments", "what kind of payments",
+    "who reports", "who has to report",
+    "what must be reported", "what is reported",
+    "dispute resolution", "review and dispute",
+    "attestation", "data submission",
 ]
 
 
