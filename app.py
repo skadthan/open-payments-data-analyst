@@ -457,6 +457,7 @@ async def on_chat_start() -> None:
 
     # Send settings panel (gear icon in the UI).
     default_provider = CONFIG["model"].get("provider", "ollama")
+    cl.user_session.set("_last_provider", default_provider)
     settings = cl.ChatSettings(inputs=_build_settings_widgets(default_provider))
     await settings.send()
 
@@ -509,6 +510,22 @@ async def on_settings_update(settings: dict) -> None:
     await cl.Message(
         content=f"Switched to **{provider_label}** / `{new_model}` (temperature {temperature})"
     ).send()
+
+
+@cl.on_settings_edit
+async def on_settings_edit(settings: dict) -> None:
+    """Fires in real-time as user edits any setting field.
+
+    When the provider dropdown changes, rebuild the settings panel so the
+    model dropdown shows the correct models for the new provider.
+    """
+    new_provider = settings.get("provider", "ollama")
+    prev_provider = cl.user_session.get("_last_provider") or CONFIG["model"].get("provider", "ollama")
+
+    if new_provider != prev_provider:
+        cl.user_session.set("_last_provider", new_provider)
+        refreshed = cl.ChatSettings(inputs=_build_settings_widgets(new_provider))
+        await refreshed.send()
 
 
 async def _answer_question(question: str) -> None:
