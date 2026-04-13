@@ -345,67 +345,66 @@ def _build_response_elements(result: dict[str, Any]) -> list:
 
 # --- Model settings helpers ------------------------------------------------
 
-def _build_model_list(provider: str) -> list[str]:
-    """Return available models for a provider."""
-    if provider == "ollama":
-        models = get_ollama_models(
-            CONFIG["model"].get("base_url", "http://localhost:11434")
-        )
-        return models if models else [CONFIG["model"]["name"]]
-    preset = PROVIDER_DEFAULTS.get(provider, {})
-    return preset.get("models", [])
+# Display labels for the "Model" dropdown.  Keys are "provider/model" so
+# the provider can be derived when the user picks one — no dynamic rebuild.
+_PROVIDER_LABELS = {
+    "ollama": "Ollama (Local)",
+    "openai": "OpenAI",
+    "anthropic": "Anthropic",
+    "google": "Google AI",
+    "deepseek": "DeepSeek",
+}
 
 
-def _build_settings_widgets(provider: str = "ollama") -> list:
-    """Build the ChatSettings input widgets for the current provider."""
-    providers = list(PROVIDER_DEFAULTS.keys())
-    provider_labels = {
-        "ollama": "Ollama (Local)",
-        "openai": "OpenAI",
-        "anthropic": "Anthropic",
-        "google": "Google AI",
-        "deepseek": "DeepSeek",
-    }
+def _build_all_model_items() -> dict[str, str]:
+    """Build a combined {value: label} dict of every model across all providers.
 
-    models = _build_model_list(provider)
-    preset = PROVIDER_DEFAULTS.get(provider, {})
-    default_model = preset.get("default_model", "")
+    Values are ``provider/model`` (e.g. ``openai/gpt-4o``).
+    Labels are human-readable (e.g. ``OpenAI — gpt-4o``).
+    Ollama models are queried live from the local server.
+    """
+    items: dict[str, str] = {}
+    for provider, preset in PROVIDER_DEFAULTS.items():
+        label_prefix = _PROVIDER_LABELS.get(provider, provider)
+        if provider == "ollama":
+            models = get_ollama_models(
+                CONFIG["model"].get("base_url", "http://localhost:11434")
+            )
+            if not models:
+                models = [CONFIG["model"]["name"]]
+        else:
+            models = preset.get("models", [])
+        for m in models:
+            key = f"{provider}/{m}"
+            items[key] = f"{label_prefix} — {m}"
+    return items
 
-    # Chainlit's React Select rejects empty-string values, so ensure
-    # every item in the list is non-empty and the initial value is valid.
-    models = [m for m in models if m]  # drop any empty strings
-    if not models:
-        models = [default_model] if default_model else [CONFIG["model"]["name"]]
-    if default_model not in models:
-        default_model = models[0]
 
-    widgets = [
-        cl.input_widget.Select(
-            id="provider",
-            label="AI Provider",
-            items={p: provider_labels.get(p, p) for p in providers},
-            initial_value=provider,
-        ),
+def _build_settings_widgets() -> list:
+    """Build the ChatSettings input widgets (called once at session start)."""
+    model_items = _build_all_model_items()
+
+    # Default selection: current Ollama model from config.
+    default_provider = CONFIG["model"].get("provider", "ollama")
+    default_model = CONFIG["model"]["name"]
+    default_key = f"{default_provider}/{default_model}"
+    if default_key not in model_items:
+        default_key = next(iter(model_items))
+
+    return [
         cl.input_widget.Select(
             id="model",
-            label="Model",
-            values=models,
-            initial_value=default_model,
+            label="AI Model",
+            items=model_items,
+            initial_value=default_key,
+            description="Pick a provider and model. Cloud models require an API key below.",
         ),
-    ]
-
-    # API key field — always present for cloud providers, hidden for Ollama.
-    if preset.get("needs_api_key", False):
-        widgets.append(
-            cl.input_widget.TextInput(
-                id="api_key",
-                label="API Key",
-                initial="",
-                placeholder="Enter your API key (stored in session only, never saved)",
-            )
-        )
-
-    widgets.append(
+        cl.input_widget.TextInput(
+            id="api_key",
+            label="API Key (required for cloud models)",
+            initial="",
+            placeholder="sk-... / anthropic-... (session only, never saved to disk)",
+        ),
         cl.input_widget.Slider(
             id="temperature",
             label="Temperature",
@@ -413,10 +412,8 @@ def _build_settings_widgets(provider: str = "ollama") -> list:
             max=1.0,
             step=0.1,
             initial=float(CONFIG["model"]["temperature"]),
-        )
-    )
-
-    return widgets
+        ),
+    ]
 
 
 # --- Chainlit handlers -----------------------------------------------------
@@ -466,9 +463,7 @@ async def on_chat_start() -> None:
     cl.user_session.set("corrections", [])
 
     # Send settings panel (gear icon in the UI).
-    default_provider = CONFIG["model"].get("provider", "ollama")
-    cl.user_session.set("_last_provider", default_provider)
-    settings = cl.ChatSettings(inputs=_build_settings_widgets(default_provider))
+    settings = cl.ChatSettings(inputs=_build_settings_widgets())
     await settings.send()
 
     stale_warning = _check_data_freshness()
@@ -478,21 +473,27 @@ async def on_chat_start() -> None:
 
 @cl.on_settings_update
 async def on_settings_update(settings: dict) -> None:
-    """Re-initialize LLM clients when the user changes provider/model/key."""
+    """Re-initialize LLM clients when the user changes model/key."""
     agent: SQLAgent | None = cl.user_session.get("agent")
     if agent is None:
         return
 
-    new_provider = settings.get("provider", "ollama")
-    new_model = settings.get("model", "")
+    # Model value is "provider/model" (e.g. "openai/gpt-4o").
+    model_key = settings.get("model", "")
+    if "/" not in model_key:
+        await cl.ErrorMessage(content="**Invalid model selection.**").send()
+        return
+    new_provider, new_model = model_key.split("/", 1)
+
     api_key = settings.get("api_key", "").strip() or None
     temperature = float(settings.get("temperature", 0.1))
 
     # Validate: cloud providers need an API key.
     needs_key = PROVIDER_DEFAULTS.get(new_provider, {}).get("needs_api_key", False)
     if needs_key and not api_key:
+        provider_label = _PROVIDER_LABELS.get(new_provider, new_provider)
         await cl.ErrorMessage(
-            content=f"**API key required.** Please enter your API key for {new_provider} in the settings panel (gear icon)."
+            content=f"**API key required.** Enter your {provider_label} API key in the settings panel, then confirm again."
         ).send()
         return
 
@@ -509,38 +510,10 @@ async def on_settings_update(settings: dict) -> None:
         ).send()
         return
 
-    # Refresh the settings panel to show model list for the new provider.
-    refreshed = cl.ChatSettings(inputs=_build_settings_widgets(new_provider))
-    await refreshed.send()
-
-    provider_label = {
-        "ollama": "Ollama (Local)", "openai": "OpenAI",
-        "anthropic": "Anthropic", "google": "Google AI", "deepseek": "DeepSeek",
-    }.get(new_provider, new_provider)
+    provider_label = _PROVIDER_LABELS.get(new_provider, new_provider)
     await cl.Message(
         content=f"Switched to **{provider_label}** / `{new_model}` (temperature {temperature})"
     ).send()
-
-
-@cl.on_settings_edit
-async def on_settings_edit(settings: dict) -> None:
-    """Fires in real-time as user edits any setting field.
-
-    When the provider dropdown changes, rebuild the settings panel so the
-    model dropdown shows the correct models for the new provider.
-    """
-    new_provider = settings.get("provider", "ollama")
-    prev_provider = cl.user_session.get("_last_provider") or CONFIG["model"].get("provider", "ollama")
-
-    # Guard against re-entrancy: sending a new ChatSettings triggers
-    # another on_settings_edit, so skip if the provider hasn't changed.
-    if new_provider != prev_provider:
-        cl.user_session.set("_last_provider", new_provider)
-        try:
-            refreshed = cl.ChatSettings(inputs=_build_settings_widgets(new_provider))
-            await refreshed.send()
-        except Exception:
-            pass  # swallow rebuild errors to avoid crashing the UI
 
 
 async def _answer_question(question: str) -> None:
