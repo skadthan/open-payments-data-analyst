@@ -486,7 +486,7 @@ async def on_settings_update(settings: dict) -> None:
         return
     new_provider, new_model = model_key.split("/", 1)
 
-    api_key = settings.get("api_key", "").strip() or None
+    api_key = (settings.get("api_key") or "").strip() or None
     temperature = float(settings.get("temperature", 0.1))
 
     # Validate: cloud providers need an API key.
