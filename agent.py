@@ -47,8 +47,101 @@ warnings.filterwarnings(
     category=UserWarning,
 )
 
+import json
+
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama
+
+
+# --- Multi-provider LLM factory -------------------------------------------
+
+# Provider presets: default models and base URLs.
+PROVIDER_DEFAULTS: dict[str, dict[str, Any]] = {
+    "ollama": {
+        "models": [],  # populated dynamically from `ollama list`
+        "default_model": "qwen2.5-coder:14b",
+        "base_url": "http://localhost:11434",
+        "needs_api_key": False,
+    },
+    "openai": {
+        "models": ["gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini", "o3-mini"],
+        "default_model": "gpt-4o-mini",
+        "needs_api_key": True,
+    },
+    "anthropic": {
+        "models": [
+            "claude-sonnet-4-20250514",
+            "claude-haiku-4-5-20251001",
+            "claude-opus-4-20250514",
+        ],
+        "default_model": "claude-sonnet-4-20250514",
+        "needs_api_key": True,
+    },
+    "google": {
+        "models": ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"],
+        "default_model": "gemini-2.5-flash",
+        "needs_api_key": True,
+    },
+    "deepseek": {
+        "models": ["deepseek-chat", "deepseek-reasoner"],
+        "default_model": "deepseek-chat",
+        "base_url": "https://api.deepseek.com/v1",
+        "needs_api_key": True,
+    },
+}
+
+
+def get_ollama_models(base_url: str = "http://localhost:11434") -> list[str]:
+    """Query local Ollama for pulled models. Returns empty list on failure."""
+    try:
+        import urllib.request
+        resp = urllib.request.urlopen(f"{base_url}/api/tags", timeout=3)
+        data = json.loads(resp.read())
+        return sorted(m["name"] for m in data.get("models", []))
+    except Exception:
+        return []
+
+
+def create_llm(
+    provider: str,
+    model: str,
+    temperature: float,
+    api_key: str | None = None,
+    base_url: str | None = None,
+):
+    """Create a LangChain chat model for the given provider.
+
+    All returned objects share the same .invoke() / .astream() interface,
+    so the rest of the agent code doesn't need to know which provider is
+    active.
+    """
+    if provider == "ollama":
+        return ChatOllama(
+            model=model,
+            base_url=base_url or "http://localhost:11434",
+            temperature=temperature,
+        )
+    elif provider == "openai":
+        from langchain_openai import ChatOpenAI
+        return ChatOpenAI(model=model, api_key=api_key, temperature=temperature)
+    elif provider == "anthropic":
+        from langchain_anthropic import ChatAnthropic
+        return ChatAnthropic(model=model, api_key=api_key, temperature=temperature)
+    elif provider == "google":
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        return ChatGoogleGenerativeAI(
+            model=model, google_api_key=api_key, temperature=temperature,
+        )
+    elif provider == "deepseek":
+        from langchain_openai import ChatOpenAI
+        return ChatOpenAI(
+            model=model,
+            api_key=api_key,
+            base_url=base_url or "https://api.deepseek.com/v1",
+            temperature=temperature,
+        )
+    else:
+        raise ValueError(f"Unknown provider: {provider!r}")
 
 
 # --- Key columns (hand-curated for prompt injection) -----------------------
@@ -128,6 +221,22 @@ SYSTEM_PROMPT_TEMPLATE = """\
 You are a DuckDB SQL analyst for the CMS Open Payments dataset (calendar years 2021-2024).
 Your job is to translate the user's question into ONE DuckDB SQL query.
 
+Dataset overview:
+  CMS Open Payments tracks financial relationships between the healthcare industry
+  (pharmaceutical/medical device companies) and healthcare providers (physicians,
+  teaching hospitals). There are three payment categories:
+  - **general_payments**: Direct payments to physicians and teaching hospitals
+    (consulting fees, food & beverage, travel, education, royalties, speaking fees, etc.).
+    This is the largest table (~12M+ rows/year). Key field: Nature_of_Payment_or_Transfer_of_Value
+    with values like 'Food and Beverage', 'Consulting Fee', 'Travel and Lodging',
+    'Education', 'Compensation for services other than consulting', 'Royalty or License',
+    'Current or prospective ownership or investment interest', 'Honoraria', 'Gift',
+    'Entertainment', 'Charitable Contribution', 'Grant'.
+  - **research_payments**: Payments for clinical research funded by industry.
+    Includes principal investigator details and research study info.
+  - **ownership_payments**: Physician ownership/investment interests in companies.
+    Uses Total_Amount_Invested_USDollars (NOT Total_Amount_of_Payment_USDollars).
+
 Schema (key columns only; more columns exist but rarely matter):
 {compact_schema}
 
@@ -177,9 +286,63 @@ Rules:
     ```
 
     All three guards (A, B, C) are required together — omitting any one produces misleading results. This rule applies ONLY when the user is asking ABOUT products/drugs/devices. If the user is filtering BY a known product name (e.g. "how much was spent on Humira?") or asking about something unrelated (payment types, specialties, manufacturers), ignore this rule.
-13. If the question is unrelated to CMS Open Payments AND the chat history shows no prior on-topic exchange, respond with exactly: SELECT 'unsupported' AS note;
+13. When combining rows from different payment tables with UNION ALL, the monetary column names differ: general/research use `Total_Amount_of_Payment_USDollars`, ownership uses `Total_Amount_Invested_USDollars`. You MUST alias them to a common name so the UNION is valid. Example:
+    ```sql
+    SELECT Total_Amount_of_Payment_USDollars AS amount FROM general_payments_2024
+    UNION ALL
+    SELECT Total_Amount_of_Payment_USDollars AS amount FROM research_payments_2024
+    UNION ALL
+    SELECT Total_Amount_Invested_USDollars AS amount FROM ownership_payments_2024
+    ```
+    Then the outer query can safely reference `amount`. Never reference the original differing column names after a UNION ALL.
+14. If the question is unrelated to CMS Open Payments AND the chat history shows no prior on-topic exchange, respond with exactly: SELECT 'unsupported' AS note;
    However, if the chat history shows the user is refining, retrying, or follow-up-asking about a prior on-topic question (e.g. "try case-insensitive", "what about 2023?", "show me the chart"), treat the new question as on-topic and answer it.
 """
+
+# Few-shot examples injected as user/assistant pairs before the real question.
+# These teach the model SQL *patterns* that rules alone struggle to convey.
+FEW_SHOT_EXAMPLES: list[tuple[str, str]] = [
+    # 1. Cross-table UNION ALL with proper column aliasing (the #1 failure mode)
+    (
+        "What is the total dollar value for each payment type in 2024?",
+        """\
+SELECT 'General Payments' AS Payment_Type, SUM(Total_Amount_of_Payment_USDollars) AS Total_Value FROM general_payments_2024
+UNION ALL
+SELECT 'Research Payments', SUM(Total_Amount_of_Payment_USDollars) FROM research_payments_2024
+UNION ALL
+SELECT 'Ownership Interest', SUM(Total_Amount_Invested_USDollars) FROM ownership_payments_2024
+UNION ALL
+SELECT 'Grand Total', SUM(amount) FROM (
+    SELECT Total_Amount_of_Payment_USDollars AS amount FROM general_payments_2024
+    UNION ALL
+    SELECT Total_Amount_of_Payment_USDollars AS amount FROM research_payments_2024
+    UNION ALL
+    SELECT Total_Amount_Invested_USDollars AS amount FROM ownership_payments_2024
+) AS combined;""",
+    ),
+    # 2. Single-table aggregation with manufacturer wildcard ILIKE
+    (
+        "Top 5 companies by total general payments in 2023",
+        """\
+SELECT Applicable_Manufacturer_or_Applicable_GPO_Making_Payment_Name AS Company,
+       SUM(Total_Amount_of_Payment_USDollars) AS Total_Payments
+FROM general_payments_2023
+GROUP BY Applicable_Manufacturer_or_Applicable_GPO_Making_Payment_Name
+ORDER BY Total_Payments DESC
+LIMIT 5;""",
+    ),
+    # 3. Cross-year query using the all_* view
+    (
+        "Compare total general payments in 2021 vs 2024",
+        """\
+SELECT Program_Year, SUM(Total_Amount_of_Payment_USDollars) AS Total_Payments
+FROM all_general_payments
+WHERE Program_Year IN (2021, 2024)
+GROUP BY Program_Year
+ORDER BY Program_Year
+LIMIT 100;""",
+    ),
+]
 
 SUMMARIZE_PROMPT_TEMPLATE = """\
 You are answering a user's question about CMS Open Payments data.
@@ -283,7 +446,18 @@ class SchemaManager:
         "removed_deleted": "removed_deleted_2024",
     }
 
-    def __init__(self, con: duckdb.DuckDBPyConnection) -> None:
+    # Map table_type → data dictionary filename prefix (CMS typo included).
+    _DICT_PREFIX = {
+        "general_payments": "General_Paymemnts",
+        "research_payments": "Research_Paymemnts",
+        "ownership_payments": "Ownership_Paymemnts",
+    }
+
+    def __init__(
+        self,
+        con: duckdb.DuckDBPyConnection,
+        dictionaries_dir: str | Path | None = None,
+    ) -> None:
         self._types: dict[tuple[str, str], str] = {}
         for table_type, view_name in self._REP_VIEW.items():
             rows = con.execute(
@@ -294,13 +468,46 @@ class SchemaManager:
             for column_name, data_type in rows:
                 self._types[(table_type, column_name)] = data_type or "?"
 
+        # Load column descriptions from data dictionary JSONs.
+        self._descriptions: dict[tuple[str, str], str] = {}
+        if dictionaries_dir:
+            self._load_descriptions(Path(dictionaries_dir))
+
+    def _load_descriptions(self, base_dir: Path) -> None:
+        """Load column descriptions from the most recent year's data dictionary."""
+        # Use 2024 (most recent) — descriptions are stable across years.
+        year_dir = base_dir / "2024"
+        if not year_dir.exists():
+            return
+        for table_type, prefix in self._DICT_PREFIX.items():
+            dict_file = year_dir / f"{prefix}_DataDictionary_2024.json"
+            if not dict_file.exists():
+                continue
+            try:
+                data = json.loads(dict_file.read_text(encoding="utf-8"))
+                for field in data.get("data", {}).get("fields", []):
+                    col_name = field.get("name", "")
+                    desc = field.get("description", "")
+                    if col_name and desc:
+                        # Truncate long descriptions to keep prompt concise.
+                        short = desc[:120].rstrip()
+                        if len(desc) > 120:
+                            short += "..."
+                        self._descriptions[(table_type, col_name)] = short
+            except Exception:
+                continue
+
     def compact_schema(self) -> str:
         lines: list[str] = []
         for table_type, cols in KEY_COLUMNS.items():
             lines.append(f"  {table_type}:")
             for col in cols:
                 dtype = self._types.get((table_type, col), "?")
-                lines.append(f"    - {col} [{dtype}]")
+                desc = self._descriptions.get((table_type, col))
+                if desc:
+                    lines.append(f"    - {col} [{dtype}] — {desc}")
+                else:
+                    lines.append(f"    - {col} [{dtype}]")
         return "\n".join(lines)
 
 
@@ -332,21 +539,52 @@ class SQLAgent:
                 "an exclusive lock. Close it and try again."
             ) from e
 
-        self.schema = SchemaManager(self.con)
+        dict_dir = cfg["data"].get("dictionaries_dir")
+        self.schema = SchemaManager(self.con, dictionaries_dir=dict_dir)
         self.system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
             compact_schema=self.schema.compact_schema()
         )
 
-        self.llm_sql = ChatOllama(
-            model=cfg["model"]["name"],
-            base_url=cfg["model"]["base_url"],
-            temperature=float(cfg["model"]["temperature"]),
+        provider = cfg["model"].get("provider", "ollama")
+        model_name = cfg["model"]["name"]
+        base_url = cfg["model"].get("base_url")
+        sql_temp = float(cfg["model"]["temperature"])
+        sum_temp = float(cfg["model"]["summarization_temperature"])
+
+        self.llm_sql = create_llm(provider, model_name, sql_temp, base_url=base_url)
+        self.llm_summary = create_llm(provider, model_name, sum_temp, base_url=base_url)
+
+        # Session-scoped user corrections injected into _build_messages().
+        self._corrections: list[str] = []
+
+    # --- LLM management -----------------------------------------------------
+
+    def swap_llm(
+        self,
+        provider: str,
+        model: str,
+        api_key: str | None = None,
+        temperature: float | None = None,
+        summarization_temperature: float | None = None,
+    ) -> None:
+        """Hot-swap the LLM clients without restarting DuckDB."""
+        sql_temp = temperature if temperature is not None else float(
+            self.cfg["model"]["temperature"]
         )
-        self.llm_summary = ChatOllama(
-            model=cfg["model"]["name"],
-            base_url=cfg["model"]["base_url"],
-            temperature=float(cfg["model"]["summarization_temperature"]),
+        sum_temp = summarization_temperature if summarization_temperature is not None else float(
+            self.cfg["model"]["summarization_temperature"]
         )
+        base_url = PROVIDER_DEFAULTS.get(provider, {}).get("base_url")
+        self.llm_sql = create_llm(provider, model, sql_temp, api_key=api_key, base_url=base_url)
+        self.llm_summary = create_llm(provider, model, sum_temp, api_key=api_key, base_url=base_url)
+
+    def set_corrections(self, corrections: list[str]) -> None:
+        """Replace the session-scoped user corrections list."""
+        self._corrections = list(corrections)
+
+    def add_correction(self, correction: str) -> None:
+        """Append a single user correction for this session."""
+        self._corrections.append(correction)
 
     # --- LLM call construction -------------------------------------------
 
@@ -357,6 +595,17 @@ class SQLAgent:
         chat_history: list[tuple[str, str]],
     ) -> list:
         msgs: list = [SystemMessage(content=self.system_prompt)]
+
+        # Inject session-scoped user corrections as an additional system message.
+        if self._corrections:
+            corrections_text = "User corrections for this session (follow these strictly):\n"
+            corrections_text += "\n".join(f"- {c}" for c in self._corrections)
+            msgs.append(SystemMessage(content=corrections_text))
+
+        # Few-shot examples teach SQL patterns more effectively than rules.
+        for example_q, example_sql in FEW_SHOT_EXAMPLES:
+            msgs.append(HumanMessage(content=example_q))
+            msgs.append(AIMessage(content=example_sql))
 
         # Last 4 exchanges for conversational context.
         for prev_q, prev_a in chat_history[-4:]:

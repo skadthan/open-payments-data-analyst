@@ -36,7 +36,7 @@ import pandas as pd
 import plotly.express as px
 import yaml
 
-from agent import SQLAgent
+from agent import SQLAgent, PROVIDER_DEFAULTS, get_ollama_models, create_llm
 
 
 # --- Config (loaded once at import time) -----------------------------------
@@ -343,6 +343,72 @@ def _build_response_elements(result: dict[str, Any]) -> list:
     return elements
 
 
+# --- Model settings helpers ------------------------------------------------
+
+def _build_model_list(provider: str) -> list[str]:
+    """Return available models for a provider."""
+    if provider == "ollama":
+        models = get_ollama_models(
+            CONFIG["model"].get("base_url", "http://localhost:11434")
+        )
+        return models if models else [CONFIG["model"]["name"]]
+    preset = PROVIDER_DEFAULTS.get(provider, {})
+    return preset.get("models", [])
+
+
+def _build_settings_widgets(provider: str = "ollama") -> list:
+    """Build the ChatSettings input widgets for the current provider."""
+    providers = list(PROVIDER_DEFAULTS.keys())
+    provider_labels = {
+        "ollama": "Ollama (Local)",
+        "openai": "OpenAI",
+        "anthropic": "Anthropic",
+        "google": "Google AI",
+        "deepseek": "DeepSeek",
+    }
+
+    models = _build_model_list(provider)
+    preset = PROVIDER_DEFAULTS.get(provider, {})
+    default_model = preset.get("default_model", models[0] if models else "")
+
+    widgets = [
+        cl.input_widget.Select(
+            id="provider",
+            label="AI Provider",
+            items={p: provider_labels.get(p, p) for p in providers},
+            initial_value=provider,
+        ),
+        cl.input_widget.Select(
+            id="model",
+            label="Model",
+            values=models if models else [default_model],
+            initial_value=default_model if default_model in models else (models[0] if models else ""),
+        ),
+    ]
+
+    if preset.get("needs_api_key", False):
+        widgets.append(
+            cl.input_widget.TextInput(
+                id="api_key",
+                label="API Key",
+                placeholder="Enter your API key (stored in session only, never saved)",
+            )
+        )
+
+    widgets.append(
+        cl.input_widget.Slider(
+            id="temperature",
+            label="Temperature",
+            min=0.0,
+            max=1.0,
+            step=0.1,
+            initial=float(CONFIG["model"]["temperature"]),
+        )
+    )
+
+    return widgets
+
+
 # --- Chainlit handlers -----------------------------------------------------
 
 @cl.set_starters
@@ -386,21 +452,63 @@ async def on_chat_start() -> None:
 
     cl.user_session.set("agent", agent)
     cl.user_session.set("chat_history", [])
-    # R3.8 — Untrimmed session log for the "Export to PDF" action. Unlike
-    # chat_history (last 5 turns only, used for LLM context), session_log
-    # captures every Q/A pair for the duration of the session so the user
-    # can take a PDF home at the end of the demo.
     cl.user_session.set("session_log", [])
+    cl.user_session.set("corrections", [])
 
-    # Intentionally no greeting bubble: sending any message here collapses
-    # the Chainlit starter landing (big logo + starter buttons) into chat
-    # mode. The landing IS the greeting. The description text lives in
-    # chainlit.md (accessible via the Readme button). The bottom-left
-    # brand watermark in public/branding.css keeps the logo visible
-    # during the chat itself.
+    # Send settings panel (gear icon in the UI).
+    default_provider = CONFIG["model"].get("provider", "ollama")
+    settings = cl.ChatSettings(inputs=_build_settings_widgets(default_provider))
+    await settings.send()
+
     stale_warning = _check_data_freshness()
     if stale_warning:
         await cl.Message(content=stale_warning).send()
+
+
+@cl.on_settings_update
+async def on_settings_update(settings: dict) -> None:
+    """Re-initialize LLM clients when the user changes provider/model/key."""
+    agent: SQLAgent | None = cl.user_session.get("agent")
+    if agent is None:
+        return
+
+    new_provider = settings.get("provider", "ollama")
+    new_model = settings.get("model", "")
+    api_key = settings.get("api_key", "").strip() or None
+    temperature = float(settings.get("temperature", 0.1))
+
+    # Validate: cloud providers need an API key.
+    needs_key = PROVIDER_DEFAULTS.get(new_provider, {}).get("needs_api_key", False)
+    if needs_key and not api_key:
+        await cl.ErrorMessage(
+            content=f"**API key required.** Please enter your API key for {new_provider} in the settings panel (gear icon)."
+        ).send()
+        return
+
+    try:
+        agent.swap_llm(
+            provider=new_provider,
+            model=new_model,
+            api_key=api_key,
+            temperature=temperature,
+        )
+    except Exception as e:
+        await cl.ErrorMessage(
+            content=f"**Failed to switch model.**\n\n{e}"
+        ).send()
+        return
+
+    # Refresh the settings panel to show model list for the new provider.
+    refreshed = cl.ChatSettings(inputs=_build_settings_widgets(new_provider))
+    await refreshed.send()
+
+    provider_label = {
+        "ollama": "Ollama (Local)", "openai": "OpenAI",
+        "anthropic": "Anthropic", "google": "Google AI", "deepseek": "DeepSeek",
+    }.get(new_provider, new_provider)
+    await cl.Message(
+        content=f"Switched to **{provider_label}** / `{new_model}` (temperature {temperature})"
+    ).send()
 
 
 async def _answer_question(question: str) -> None:
@@ -508,6 +616,23 @@ async def _answer_question(question: str) -> None:
                 payload={},
                 label="📄 Export session to PDF",
                 tooltip="Download a PDF of every Q/A in this session so far",
+            )
+        )
+        # Feedback buttons — thumbs up/down to rate and improve the AI.
+        actions.append(
+            cl.Action(
+                name="feedback_up",
+                payload={"question": question},
+                label="👍",
+                tooltip="This answer was helpful",
+            )
+        )
+        actions.append(
+            cl.Action(
+                name="feedback_down",
+                payload={"question": question, "sql": prep.get("sql", "")},
+                label="👎",
+                tooltip="This answer was wrong — click to tell me what to fix",
             )
         )
         msg = cl.Message(content="", elements=elements, actions=actions)
@@ -647,6 +772,56 @@ async def on_export_pdf(action: cl.Action) -> None:
                 display="inline",
             )
         ],
+    ).send()
+
+
+@cl.action_callback("feedback_up")
+async def on_feedback_up(action: cl.Action) -> None:
+    """Acknowledge positive feedback."""
+    try:
+        await action.remove()
+    except Exception:
+        pass
+    await cl.Message(content="Thanks for the feedback!").send()
+
+
+@cl.action_callback("feedback_down")
+async def on_feedback_down(action: cl.Action) -> None:
+    """Prompt user for correction text, then inject it into the agent."""
+    try:
+        await action.remove()
+    except Exception:
+        pass
+
+    # Ask the user what was wrong.
+    res = await cl.AskUserMessage(
+        content="What was wrong with this answer? Your feedback will improve future responses in this session.",
+        timeout=120,
+    ).send()
+
+    if res is None or not res.get("output", "").strip():
+        await cl.Message(content="No feedback received — skipped.").send()
+        return
+
+    correction = res["output"].strip()
+    question = (action.payload or {}).get("question", "")
+    sql = (action.payload or {}).get("sql", "")
+
+    # Build a contextual correction for the agent.
+    correction_entry = correction
+    if question:
+        correction_entry = f'For the question "{question}": {correction}'
+
+    corrections: list[str] = cl.user_session.get("corrections") or []
+    corrections.append(correction_entry)
+    cl.user_session.set("corrections", corrections)
+
+    agent: SQLAgent | None = cl.user_session.get("agent")
+    if agent:
+        agent.add_correction(correction_entry)
+
+    await cl.Message(
+        content=f"Got it — I'll apply this correction to future queries in this session:\n> {correction}"
     ).send()
 
 
