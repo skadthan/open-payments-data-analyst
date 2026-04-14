@@ -84,6 +84,24 @@ python run.py
 > browser with a blank screen. See `phase-3-plan.md` "Observed issues
 > and fixes" for the full bisect.
 
+### Moving the project between machines
+
+DuckDB bakes absolute paths into view DDL, so `openpayments.duckdb` is
+**not portable by itself**. Two supported options:
+
+1. **Re-ingest on each machine (recommended).** Copy `Datasets/` and run
+   `python ingest.py` locally. Fastest to reason about; the DB is always
+   in sync with the parquet files on the machine that built it.
+2. **Copy `data/parquet/` only, let startup re-register the views.**
+   `python run.py` calls `ingest.refresh_views()` on every startup, which
+   rediscovers parquets under `config.data.parquet_dir` and rewrites all
+   per-year and `all_*` views with correct local paths. If you copy the
+   `.duckdb` file too it's repaired in place; if not, it's built fresh.
+
+Python 3.11 or 3.12 is recommended (3.9 is EOL and chainlit ≥1.1 hits
+ContextVar issues on it; 3.14 works because `run.py` patches
+`nest_asyncio`).
+
 ## Project Structure
 
 ```

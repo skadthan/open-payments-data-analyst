@@ -43,6 +43,65 @@ nest_asyncio.apply = lambda: None  # type: ignore[assignment]
 from chainlit.cli import cli  # noqa: E402
 
 
+# Portability fix — repair views after the .duckdb file was copied.
+#
+# DuckDB inlines absolute file paths into every `CREATE VIEW ... read_parquet(...)`
+# statement. Copying openpayments.duckdb from machine A to machine B therefore
+# leaves every view pointing at machine A's filesystem, and the app fails with
+# IO / "file not found" errors. We fix this idempotently on each startup by
+# rediscovering the parquets under config.data.parquet_dir on *this* machine
+# and rewriting the views to match. Cheap (views are just SQL strings) and
+# safe even when the DB was built locally.
+def _ensure_views_fresh() -> None:
+    try:
+        import yaml
+        import duckdb
+
+        from ingest import refresh_views
+    except Exception as e:  # noqa: BLE001 — missing deps should not kill the app
+        print(f"[run.py] view refresh skipped (imports): {e}", file=sys.stderr)
+        return
+
+    root = Path(__file__).resolve().parent
+    try:
+        cfg = yaml.safe_load((root / "config.yaml").read_text(encoding="utf-8"))
+        db_path = Path(cfg["data"]["duckdb_path"]).resolve()
+        parquet_dir = Path(cfg["data"]["parquet_dir"]).resolve()
+    except Exception as e:  # noqa: BLE001
+        print(f"[run.py] view refresh skipped (config): {e}", file=sys.stderr)
+        return
+
+    if not db_path.exists():
+        # First run on this machine — user still needs to run `python ingest.py`.
+        # Let the app start and surface its own clearer error.
+        return
+    if not parquet_dir.exists():
+        print(
+            f"[run.py] parquet dir {parquet_dir} is missing — run `python ingest.py`",
+            file=sys.stderr,
+        )
+        return
+
+    try:
+        con = duckdb.connect(str(db_path))  # read-write required for CREATE VIEW
+        try:
+            by_type = refresh_views(con, parquet_dir)
+        finally:
+            con.close()
+        years_summary = ", ".join(
+            f"{t}={min(ys)}-{max(ys)}" for t, ys in sorted(by_type.items())
+        )
+        print(f"[run.py] views refreshed against {parquet_dir} ({years_summary})")
+    except duckdb.IOException as e:
+        # Another process (another `python run.py`, or the duckdb CLI) is
+        # holding the lock. Not fatal — existing views may already be correct.
+        print(f"[run.py] view refresh skipped (DB locked): {e}", file=sys.stderr)
+    except FileNotFoundError as e:
+        print(f"[run.py] view refresh skipped: {e}", file=sys.stderr)
+    except Exception as e:  # noqa: BLE001
+        print(f"[run.py] view refresh failed: {e}", file=sys.stderr)
+
+
 # R3.3 — Live record counts in the Readme dialog.
 #
 # We render chainlit.md.template → chainlit.md on each startup with real
@@ -102,6 +161,7 @@ def _render_chainlit_md() -> None:
 
 
 def main() -> None:
+    _ensure_views_fresh()
     _render_chainlit_md()
     extra_args = sys.argv[1:]
     sys.argv = ["chainlit", "run", "app.py", *extra_args]

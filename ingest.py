@@ -33,6 +33,14 @@ CSV_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Matches the parquet filenames written by convert_csv_to_parquet(), e.g.
+# `general_payments_2024.parquet`. Used by refresh_views() to rediscover
+# files on a machine that did not itself run ingest (i.e. when the
+# .duckdb file was copied from elsewhere).
+PARQUET_PATTERN = re.compile(
+    r"^(general_payments|research_payments|ownership_payments|removed_deleted)_(\d{4})\.parquet$"
+)
+
 GROUP_TO_TABLE = {
     "DTL_GNRL": "general_payments",
     "DTL_RSRCH": "research_payments",
@@ -171,34 +179,81 @@ def convert_csv_to_parquet(
 
 # --- DuckDB view registration -----------------------------------------------
 
+def discover_parquets(parquet_dir: Path) -> list[tuple[str, int, Path]]:
+    """Scan parquet_dir for files matching PARQUET_PATTERN.
+
+    Mirrors discover_csvs() but operates on already-ingested parquet
+    files. Used by refresh_views() to rebuild view DDL on a machine
+    that received a copy of openpayments.duckdb without running ingest.
+    """
+    found: list[tuple[str, int, Path]] = []
+    if not parquet_dir.exists():
+        return found
+    for path in sorted(parquet_dir.glob("*.parquet")):
+        m = PARQUET_PATTERN.match(path.name)
+        if not m:
+            continue
+        found.append((m.group(1), int(m.group(2)), path.resolve()))
+    found.sort(key=lambda t: (t[0], t[1]))
+    return found
+
+
 def register_parquet_tables(
     con: duckdb.DuckDBPyConnection,
     manifest: list[tuple[str, int, Path]],
 ) -> dict[str, list[int]]:
-    """Create per-year views + all_* UNION views. Returns {table_type: [years]}."""
+    """Create per-year views + all_* UNION views. Returns {table_type: [years]}.
+
+    all_* views use read_parquet([...], union_by_name=true) rather than
+    SQL-level UNION ALL so column drift across program years (CMS has
+    added/renamed columns between publications) does not blow up at
+    query time.
+    """
     by_type: dict[str, list[int]] = {}
+    paths_by_type: dict[str, list[str]] = {}
     for table_type, year, pq_path in manifest:
         view_name = f"{table_type}_{year}"
+        pq_sql = sql_path(pq_path)
         con.execute(
             f"""
             CREATE OR REPLACE VIEW {view_name} AS
-                SELECT * FROM read_parquet('{sql_path(pq_path)}')
+                SELECT * FROM read_parquet('{pq_sql}')
             """
         )
         by_type.setdefault(table_type, []).append(year)
+        paths_by_type.setdefault(table_type, []).append(pq_sql)
 
-    for table_type, years in by_type.items():
-        years_sorted = sorted(years)
-        union_sql = "\n                UNION ALL\n                ".join(
-            f"SELECT * FROM {table_type}_{y}" for y in years_sorted
-        )
+    for table_type, paths in paths_by_type.items():
+        path_list = ", ".join(f"'{p}'" for p in sorted(paths))
         con.execute(
             f"""
             CREATE OR REPLACE VIEW all_{table_type} AS
-                {union_sql}
+                SELECT * FROM read_parquet([{path_list}], union_by_name=true)
             """
         )
     return by_type
+
+
+def refresh_views(
+    con: duckdb.DuckDBPyConnection,
+    parquet_dir: Path,
+) -> dict[str, list[int]]:
+    """Re-register all per-year and all_* views against parquet_dir.
+
+    Idempotent. Call this on app startup to repair a .duckdb file that
+    was copied from another machine — CREATE VIEW bakes absolute paths
+    into its SQL, so the views in a copied DB point at the original
+    machine's filesystem and must be rewritten.
+
+    Raises FileNotFoundError if no recognized parquet files are present.
+    """
+    manifest = discover_parquets(parquet_dir)
+    if not manifest:
+        raise FileNotFoundError(
+            f"No recognized parquet files under {parquet_dir}. "
+            "Run `python ingest.py` first."
+        )
+    return register_parquet_tables(con, manifest)
 
 
 # --- Schema metadata --------------------------------------------------------
