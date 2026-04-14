@@ -1,0 +1,71 @@
+flowchart TB
+    User([User browser])
+
+    subgraph UI["Chainlit UI  (app.py, launched via run.py)"]
+        Chat["on_message / starters / actions<br/>(table, chart, SQL toggle, PDF export, follow-ups)"]
+    end
+
+    subgraph Router["Query Router  (rag.classify_question)"]
+        Mode{{"query_mode:<br/>auto | sql | rag"}}
+    end
+
+    subgraph Agent["SQLAgent  (agent.py)"]
+        Prep["prepare():<br/>build prompt + schema<br/>→ generate SQL<br/>→ execute on DuckDB<br/>→ retry on error (max_retries)"]
+        Stream["stream_summary():<br/>LLM summarizes rows"]
+        Follow["suggest_followups()"]
+    end
+
+    subgraph RAG["DocumentRAG  (rag.py)"]
+        Retrieve["query(): embed question<br/>→ top-k chunks from ChromaDB"]
+        Answer["stream_rag_answer():<br/>LLM answers from chunks"]
+    end
+
+    subgraph LLM["LLM providers  (via LangChain)"]
+        Ollama["Ollama (local, default)<br/>qwen2.5-coder:14b + nomic-embed-text"]
+        Cloud["OpenAI / Anthropic / Google / DeepSeek<br/>(switchable via config + API key)"]
+    end
+
+    subgraph Data["Data layer (local disk)"]
+        CSV["Datasets/<br/>CMS Open Payments CSVs<br/>(2018–2024, ~80M rows)"]
+        PQ["data/parquet/<br/>general / research / ownership / removed_deleted<br/>× 7 years"]
+        DDB[("data/openpayments.duckdb<br/>per-year + all_* views<br/>+ _schema_metadata")]
+        PDFs["ProgramData/<br/>FAQ, law_policy, user_guides,<br/>data_dictionary, cms_website.txt"]
+        Vec[("data/vectorstore/<br/>ChromaDB collection<br/>cms_open_payments_docs")]
+    end
+
+    subgraph Ingest["One-time ingestion"]
+        Ing1["ingest.py<br/>CSV → Parquet, register views,<br/>load DataDictionaries/*.json"]
+        Ing2["rag.py --ingest<br/>PDF/TXT → chunk → embed → Chroma"]
+    end
+
+    User <--> Chat
+    Chat --> Mode
+    Mode -- sql / hybrid --> Prep
+    Mode -- rag --> Retrieve
+    Mode -- hybrid --> Retrieve
+    Retrieve -. chunks injected into system prompt .-> Prep
+    Prep --> DDB
+    DDB --> Prep
+    Prep --> Stream
+    Retrieve --> Answer
+    Stream --> Chat
+    Answer --> Chat
+    Stream --> Follow --> Chat
+
+    Prep <-->|SQL + summary| LLM
+    Answer <-->|RAG answer| LLM
+    Mode <-->|classify| LLM
+    Retrieve <-->|embed query| Ollama
+
+    CSV --> Ing1 --> PQ
+    Ing1 --> DDB
+    PDFs --> Ing2
+    Ing2 <-->|embed| Ollama
+    Ing2 --> Vec
+    Retrieve --> Vec
+
+    config["config.yaml<br/>(single source of truth:<br/>model, data paths, RAG, UI)"] -.-> Chat
+    config -.-> Prep
+    config -.-> Retrieve
+    config -.-> Ing1
+    config -.-> Ing2
